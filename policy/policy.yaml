@@ -1,0 +1,213 @@
+# social-agent policy (machine-readable)
+# Parsed by policy/yaml_lite.py (pure stdlib). Keep to this subset:
+# nested mappings (2-space indent), "- item" lists, "key: value" scalars.
+# No flow syntax, no anchors, no multi-line strings.
+
+version: 1
+
+defaults:
+  mode: propose
+  dry_run: true
+  require_approval: true
+
+approvals:
+  required_for:
+    - post
+    - like
+    - comment
+    - follow
+    - unfollow
+    - retweet
+    - dm
+    - profile
+  approver: user
+  expiry_hours: 24
+  per_type:
+    post: require
+    post_video: require
+    publish: require
+    like: require
+    comment: require
+    follow: require
+    retweet: require
+    reply: require
+    dm: require
+    profile: require
+    hide_spam: auto
+    hide_other: require
+  note: "Unified approval queue (approvals/pending.json). per_type: require = human must approve (safe default for anything unlisted); auto = act immediately, still logged. hide_spam:auto only fires on pre-approved moderation.auto_hide rule matches. Profile changes ALWAYS need explicit approval, even in autonomous mode — there is no code path that auto-approves them."
+
+# Selective engagement: what counts as "interesting" enough to like/follow.
+interests:
+  enabled: true
+  topics:
+    - ai video
+    - sora
+    - veo
+    - runway
+  hashtags:
+    - aivideo
+    - generativeart
+  authors: []
+  quality_signals:
+    min_likes: 50
+    min_comments: 5
+  weights:
+    topic: 2
+    hashtag: 3
+    author: 4
+    quality_signal: 1
+  threshold: 5
+  note: "A post is interesting when its score >= threshold. Likes are only proposed/approved for interesting posts when post details are supplied."
+
+# Anti-spam / anti-abuse guards for engagement.
+engagement:
+  likes_per_hour: 20
+  likes_per_day: 100
+  follows_per_day: 30
+  like_author_cooldown_hours: 24
+  min_seconds_between_likes: 60
+  note: "Separate from rate_limits (which cap all actions). Refused likes/follows are logged to refusals.jsonl with a reason."
+
+quiet_hours:
+  enabled: false
+  start: "22:00"
+  end: "08:00"
+  timezone: local
+  note: "When enabled, acting operations are refused during quiet hours."
+
+rate_limits:
+  default:
+    actions_per_hour: 10
+    actions_per_day: 50
+  tiktok:
+    actions_per_hour: 10
+    actions_per_day: 40
+    like:
+      per_hour: 30
+      per_day: 200
+    comment:
+      per_hour: 20
+      per_day: 100
+    follow:
+      per_hour: 10
+      per_day: 30
+  x:
+    actions_per_hour: 15
+    actions_per_day: 100
+    like:
+      per_hour: 40
+      per_day: 300
+  instagram:
+    actions_per_hour: 10
+    actions_per_day: 50
+  facebook:
+    actions_per_hour: 10
+    actions_per_day: 50
+  youtube:
+    actions_per_hour: 10
+    actions_per_day: 50
+  reddit:
+    actions_per_hour: 20
+    actions_per_day: 100
+  note: "Central controller (ratelimit/): per (platform, action) sliding windows. Per-action overrides are conservative defaults — raise deliberately. Denied actions are queued as rate_limited with retry_at (never dropped); consecutive denials widen the retry window exponentially."
+
+watchers:
+  poll_interval_seconds: 300
+  max_events_per_poll: 50
+  note: "Watchers are poll-based and read-only. They observe and propose; they never act."
+
+blocklists:
+  keywords:
+    - crypto giveaway
+    - double your money
+    - free followers
+  users: []
+  note: "Events matching blocklist entries are flagged, never auto-acted on."
+
+prohibited:
+  - mass_follow_unfollow
+  - comment_spam
+  - astroturfing
+  - credential_storage
+  - bypassing_rate_limits
+  - acting_without_approval
+  - profile_change_without_explicit_approval
+
+autonomy:
+  note: "Autonomous mode is granted per-mission (`autonomy grant --mission <name> --confirm`) and revocable (`autonomy revoke`). Inside mission scope the agent may act without per-action approval; outside scope actions are blocked and logged to refusals.jsonl. Profile changes and DMs can never be auto-approved."
+
+# Growth, voice, and identity: the agent may grow accounts organically,
+# write like a human, and embody the account owner — but ALL of this sits
+# UNDER the ToS layer. Growth tactics are organic-only (no pods, no
+# engagement bait, no fake followers); voice/identity checks run on every
+# post draft and comment. A ToS prohibition beats any growth play.
+growth:
+  note: "Organic growth only. growth/ modules (strategy, goals, audit, youtube packaging) inform content choices; they cannot authorize acting operations or override the ToS layer. Content gates (voice + identity + secrets) run on every `post draft` and `engage comment`."
+
+moderation:
+  auto_hide:
+    - double your money
+    - free crypto giveaway
+  note: "Comment moderation applies ONLY to the user's own comment sections. `moderate hide` creates a proposal requiring explicit approval; proposals matching a pre-approved auto_hide pattern may be auto-approved (still logged to actions.json). The agent never touches anyone else's content."
+
+identity:
+  note: "On social platforms the agent IS the account owner: first-person, owner's name and voice, never claims to be an AI/agent/chatbot. Personas live in <home>/identity/accounts/<label>.md and always belong to the verified account owner (ghostwriter pattern, never a third party). Identity-break text in a draft is refused and logged to refusals.jsonl."
+
+# Crisis mode: global kill switch. `crisis on` pauses ALL acting operations
+# (posts, likes, comments, follows, hides, publishes) while watchers keep
+# monitoring read-only. Pending approval items are parked as held and
+# re-pended on `crisis off` — never auto-resumed. Guard order:
+# ToS > crisis > approvals > rate limits > quiet hours.
+crisis:
+  note: "Only an explicit `crisis off` clears crisis mode. The crisis watcher's auto_pause defaults to off (opt-in): a false positive must never silence the account on its own."
+
+# Permanent memory: the agent's brain lives in <home>/memory.db (SQLite,
+# stdlib-only). Migrations run automatically; Postgres is the documented
+# scale-up path (core/POSTGRES.md). people/ JSON is a legacy store and is
+# imported once into memory.db on first access.
+memory:
+  note: "Memory is durable across restarts. Every mutation triggers an incremental backup. `memory query` is SELECT-only and enforced in code (plus PRAGMA query_only)."
+
+# Automatic backups: content-addressed snapshots under <home>/backups/
+# (manifests + deduped blobs). Triggers fire from post drafts, renders,
+# account changes, memory mutations, and before risky actions.
+backups:
+  keep_daily: 7
+  keep_hourly: 24
+  note: "Retention: keep the last keep_hourly snapshots plus one per day for keep_daily days. Restore always stages (never overwrites live files); `backup restore` dry-runs by default."
+
+# Crash recovery: append-only <home>/audit/journal.jsonl logs every acting
+# intent BEFORE execution (with an idempotency key) and marks it
+# completed/failed AFTER. `recover` verifies each unfinished intent
+# against real state — already-done work is SKIPPED, never repeated.
+recovery:
+  auto_suggest: true
+  note: "Platform-acting intents are never auto-executed after a crash; they need human re-approval. Safe local work (renders) may re-execute with `recover --execute`."
+
+# ToS acknowledged risk: EMPTY by default. The ToS layer fails closed on
+# prohibited actions (e.g. X browser-driven engagement, which X's terms
+# restrict to API-only automation). If the user explicitly opts a platform
+# in here, a prohibition DOWNGRADESTO restricted with a loud, logged
+# advisory — the risk is the user's informed choice, and the agent records
+# it. Without the acknowledgment, prohibitions stay fail-closed.
+tos:
+  # To opt in, add block-style entries, e.g.:
+  #   acknowledged_risk:
+  #     - x
+  acknowledged_risk:
+
+# Execution tickets for the agent browser (no APIs, no Playwright).
+# social-agent never drives a browser itself: approved actions become
+# machine-readable tickets (hands/tickets/) that the external agent's
+# browser fulfills. Active hours + the central rate-limit controller
+# apply to every ticket.
+hands:
+  active_hours:
+    enabled: false
+    start: "08:00"
+    end: "23:00"
+  note: "Set active_hours.enabled: true to confine ticketed actions to a daily window."
+
+# Per-platform notes. The browser is the only backend — there is no
+# backend config key, no API backend, no API keys anywhere in this repo.

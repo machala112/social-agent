@@ -1,0 +1,3839 @@
+#!/usr/bin/env python3
+"""social-agent: autonomous social-media monitoring toolkit (offline-capable CLI).
+
+Safety model (see policy/guardrails.md):
+  * Watchers are READ-ONLY: they observe and PROPOSE, never act alone.
+  * Acting operations (post, like, comment, follow, retweet, DM) are created
+    as dry-run proposals and require an explicit per-action approval record.
+  * Per-platform rate limits and quiet hours are enforced by this CLI.
+  * No credentials are ever stored. State lives in $SOCIAL_AGENT_HOME
+    (default ~/.social-agent) as plain JSON.
+
+Everything works offline: watchers poll fixture files, engagement actions are
+proposed/approved/logged here, and live execution happens in a real browser
+session driven by the user or their agent.
+"""
+
+import argparse
+import json
+import os
+import random
+import sys
+import time
+from datetime import datetime, timezone
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from policy import yaml_lite
+from platforms.base import get_adapter, SUPPORTED_PLATFORMS
+from platforms import tos as tos_mod
+from core.watcher_engine import REGISTRY, WatcherError, FIXTURES_DIR
+from engagement import interest as interest_mod
+from heartbeat import pinger as hb
+import missions as missions_mod
+import autonomy as autonomy_mod
+from growth import strategy as growth_strategy
+from growth import goals as growth_goals
+from growth import audit as growth_audit_mod
+from growth import youtube as yt_mod
+from voice import check as voice_check_mod
+from security import secrets as secrets_mod
+from security import audit as security_audit_mod
+from learning import study as study_mod
+from identity import check as identity_mod
+from identity import store as identity_store
+from core import scheduler as sched_mod
+from core import remote as remote_mod
+from moderation import classify as mod_classify
+from moderation import propose as mod_propose
+from captions import generate as captions_mod
+from approvals import queue as approvals_queue
+from people import db as people_db
+from ratelimit import controller as rl_controller
+from crisis import mode as crisis_mod
+import listen as listen_mod
+from video import ffmpeg as vff
+from video import plans as vplans
+from video import fit as vfit
+from audio import clips as audio_mod
+from editor import analyze as ed_analyze
+from editor import kdenlive as ed_kdenlive
+from editor import shotcut as ed_shotcut
+from editor import grading as ed_grading
+from editor import subtitles as ed_subs
+from editor import highlights as ed_hl
+from editor import broll as ed_broll
+from editor import motion as ed_motion
+from editor import branding as ed_brand
+from editor import batch as ed_batch
+from editor import qa as ed_qa
+from editor import thumbnails as ed_thumb
+from editor import camera as ed_camera
+from editor import compress as ed_compress
+from core import memory as mem_mod
+from core import backup as backup_mod
+from core import recovery as rec_mod
+from core import install as install_mod
+
+VERSION = "0.1.0"
+
+
+class Refused(Exception):
+    """Policy refusal: rate limit hit, quiet hours, or missing approval."""
+
+
+class RateLimited(Refused):
+    """Rate-bucket denial. Carries retry_at (epoch seconds); the caller
+    must queue the action as rate_limited — never silently drop it."""
+
+    def __init__(self, message, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at
+
+
+class UsageError(Exception):
+    """Bad input: unknown id, bad config, missing account."""
+
+
+# ---------------------------------------------------------------- state ---
+
+def home_dir():
+    return os.environ.get("SOCIAL_AGENT_HOME", os.path.expanduser("~/.social-agent"))
+
+
+def _path(name):
+    return os.path.join(home_dir(), name)
+
+
+def load_json(name, default):
+    p = _path(name)
+    if not os.path.exists(p):
+        return default
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def save_json(name, data):
+    os.makedirs(home_dir(), exist_ok=True)
+    p = _path(name)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, p)
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def new_id(prefix):
+    return f"{prefix}-{random.randrange(16 ** 6):06x}"
+
+
+def read_events():
+    p = _path("events.jsonl")
+    if not os.path.exists(p):
+        return []
+    out = []
+    with open(p, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line:
+                out.append(json.loads(line))
+    return out
+
+
+# --------------------------------------------------------------- policy ---
+
+_policy_cache = None
+
+
+def policy_path():
+    return os.environ.get("SOCIAL_AGENT_POLICY",
+                          os.path.join(REPO_ROOT, "policy", "policy.yaml"))
+
+
+def get_policy():
+    global _policy_cache
+    if _policy_cache is None:
+        _policy_cache = yaml_lite.load(policy_path())
+    return _policy_cache
+
+
+def check_rate_limit(platform, action="any"):
+    """Legacy wrapper: delegates to the central controller."""
+    verdict = rl_controller.check(home_dir(), platform, action, get_policy())
+    if not verdict["allowed"]:
+        raise RateLimited(verdict["reason"], retry_at=verdict["retry_at"])
+
+
+def record_action(platform, action="any"):
+    """Legacy wrapper: consume one token from the central controller."""
+    rl_controller.consume(home_dir(), platform, action)
+
+
+def in_quiet_hours(now=None):
+    qh = get_policy()["quiet_hours"]
+    if not qh.get("enabled"):
+        return False
+    now = now or datetime.now().astimezone()
+    s, e = qh["start"], qh["end"]
+    cur = now.strftime("%H:%M")
+    if s <= e:
+        return s <= cur < e
+    return cur >= s or cur < e
+
+
+def guard_acting(platform, action):
+    """Gate every acting operation.
+
+    Layer order (ToS is the ceiling — nothing below can override it):
+      1. Platform Terms of Service (platforms/<name>/tos_rules.yaml)
+      2. Crisis mode (global kill switch)
+      3. Rate limits (central controller; denial -> RateLimited, never dropped)
+      4. Quiet hours
+    Mission scope / autonomy / per-type approval policy are checked by the
+    caller after this gate.
+    """
+    tos_class = tos_mod.CLI_OP_TO_CLASS.get(action)
+    if tos_class is None:
+        raise Refused(f"no ToS classification for action {action!r}; refusing by default")
+    try:
+        tos_mod.check_tos(platform, tos_class, policy=get_policy(),
+                          home=home_dir())
+    except tos_mod.ToSRefusal as e:
+        log_refusal(action, platform, "", f"ToS: {e}")
+        raise
+    try:
+        crisis_mod.check(home_dir())
+    except crisis_mod.CrisisActive as e:
+        log_refusal(action, platform, "", f"crisis: {e}")
+        raise Refused(str(e))
+    check_rate_limit(platform, action)
+    if in_quiet_hours():
+        raise Refused("quiet hours active: acting operations are paused")
+
+
+def approval_valid(action):
+    age_h = (time.time() - action.get("approved_at_ts", 0)) / 3600.0
+    return age_h <= get_policy()["approvals"]["expiry_hours"]
+
+
+def log_refusal(action, platform, target, reason):
+    """Append a refusal record (policy said no) to refusals.jsonl."""
+    p = _path("refusals.jsonl")
+    os.makedirs(home_dir(), exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({
+            "timestamp": utcnow(), "action": action, "platform": platform,
+            "target": target, "reason": reason,
+        }) + "\n")
+
+
+def _backup_trigger(trigger, files=(), note=""):
+    """Fire a backup snapshot. Never breaks the acting path: backup
+    failures are swallowed so a snapshot hiccup can't block real work."""
+    try:
+        snap = backup_mod.snapshot(home_dir(), trigger, files=files,
+                                   note=note)
+        return snap["id"]
+    except Exception:
+        return None
+
+
+# --------------------------------------- unified approval queue bridge ---
+
+def _queue_item_for(action_type, platform, account, summary, payload,
+                    reason="", risk="normal", ref=None, status="pending",
+                    **extra):
+    """Create an item in the unified approval queue."""
+    return approvals_queue.propose(
+        home_dir(), action_type, platform, account, summary,
+        payload=payload, reason=reason, risk=risk, ref=ref, status=status,
+        **extra)
+
+
+def _apply_approval(item):
+    """Flip the underlying domain record for an approved queue item."""
+    ref = item.get("ref") or {}
+    store, rid = ref.get("store"), ref.get("id")
+    if not store or not rid:
+        return  # listener-created items (e.g. reply drafts) have no domain record
+    if store == "actions.json":
+        recs = load_json("actions.json", [])
+    elif store == "moderation.json":
+        recs = load_json("moderation.json", [])
+    elif store == "queue.json":
+        recs = load_json("queue.json", [])
+    else:
+        raise UsageError(f"unknown approval ref store {store!r}")
+    rec = next((r for r in recs if r["id"] == rid), None)
+    if rec is None:
+        raise UsageError(f"approval ref {rid!r} not found in {store}")
+    rec["status"] = "approved"
+    rec["approved_at"] = utcnow()
+    rec["approved_at_ts"] = time.time()
+    save_json(store, recs)
+
+
+def _apply_rejection(item, reason):
+    ref = item.get("ref") or {}
+    store, rid = ref.get("store"), ref.get("id")
+    if not store or not rid:
+        return
+    recs = load_json(store, [])
+    rec = next((r for r in recs if r["id"] == rid), None)
+    if rec is None:
+        raise UsageError(f"approval ref {rid!r} not found in {store}")
+    rec["status"] = "rejected"
+    rec["rejected_at"] = utcnow()
+    rec["rejection_reason"] = reason
+    save_json(store, recs)
+
+
+def _queue_rate_limited(action_type, platform, account, summary, payload):
+    """Rate-bucket denial: queue the action as rate_limited (never dropped)."""
+    verdict = rl_controller.check(home_dir(), platform, action_type,
+                                  get_policy())
+    retry_at = verdict.get("retry_at") or (time.time() + 3600)
+    item = _queue_item_for(
+        action_type, platform, account, summary, payload,
+        reason="rate bucket exhausted; will retry after retry_at",
+        risk="low", status="rate_limited", retry_at=retry_at)
+    log_refusal(action_type, platform, payload.get("target", ""),
+                f"rate limited; queued as {item['id']} for retry")
+    print(f"rate limited: action queued as {item['id']} "
+          f"(retry after {datetime.fromtimestamp(retry_at, timezone.utc).isoformat()})")
+    return item
+
+
+def check_like_guards(platform, author):
+    """Anti-spam guards for likes: caps, per-author cooldown, min interval."""
+    eng = get_policy().get("engagement", {})
+    now = time.time()
+    likes = [l for l in load_json("likes.json", []) if l.get("platform") == platform]
+    day = [l for l in likes if now - l["ts"] < 86400]
+    hour = [l for l in day if now - l["ts"] < 3600]
+    cap_h, cap_d = eng.get("likes_per_hour", 20), eng.get("likes_per_day", 100)
+    if len(hour) >= cap_h:
+        raise Refused(f"like spam guard: {platform} hourly like cap ({cap_h}) reached")
+    if len(day) >= cap_d:
+        raise Refused(f"like spam guard: {platform} daily like cap ({cap_d}) reached")
+    if author:
+        cd = eng.get("like_author_cooldown_hours", 24) * 3600
+        seen = [l["ts"] for l in likes
+                if (l.get("author") or "").lower() == author.lower()]
+        if seen and now - max(seen) < cd:
+            wait_h = (cd - (now - max(seen))) / 3600
+            raise Refused(f"like spam guard: @{author} already liked recently "
+                          f"(cooldown {wait_h:.1f}h left)")
+    gap = eng.get("min_seconds_between_likes", 60)
+    if likes and now - max(l["ts"] for l in likes) < gap:
+        wait_s = int(gap - (now - max(l["ts"] for l in likes)))
+        raise Refused(f"like spam guard: liking too fast, wait {wait_s}s")
+
+
+def record_like(platform, author, target):
+    likes = load_json("likes.json", [])
+    likes.append({"ts": time.time(), "platform": platform,
+                  "author": (author or "").lower(), "target": target})
+    save_json("likes.json", likes)
+
+
+def check_follow_guards(platform):
+    eng = get_policy().get("engagement", {})
+    cap = eng.get("follows_per_day", 30)
+    now = time.time()
+    follows = [f for f in load_json("follows.json", [])
+               if f.get("platform") == platform and now - f["ts"] < 86400]
+    if len(follows) >= cap:
+        raise Refused(f"follow guard: {platform} daily follow cap ({cap}) reached")
+
+
+def record_follow(platform, target):
+    follows = load_json("follows.json", [])
+    follows.append({"ts": time.time(), "platform": platform, "target": target})
+    save_json("follows.json", follows)
+
+
+def autonomous_decision(platform, action, text=""):
+    """If autonomy is granted and the action is in mission scope, return the
+    mission name (auto-approval applies). If autonomy is granted but the
+    action is OUT of scope, raise Refused and log it. If autonomy is not
+    granted, return None (normal approval flow)."""
+    st = autonomy_mod.load_state()
+    if not st.get("granted"):
+        return None
+    allowed, reason = autonomy_mod.check_scope(platform, action, text)
+    if not allowed:
+        log_refusal(action, platform, "", f"autonomous scope: {reason}")
+        raise Refused(f"autonomous scope block: {reason}")
+    try:
+        autonomy_mod.check_mission_limit(action)
+    except RuntimeError as e:
+        log_refusal(action, platform, "", str(e))
+        raise Refused(str(e))
+    return st.get("mission")
+
+
+# -------------------------------------------------------------- helpers ---
+
+def resolve_account(ref):
+    accounts = load_json("accounts.json", [])
+    for a in accounts:
+        if a["username"] == ref or a.get("label") == ref:
+            return a
+    raise UsageError(f"unknown account {ref!r}; see `accounts list`")
+
+
+def parse_kv(pairs):
+    cfg = {}
+    for p in pairs or []:
+        if "=" not in p:
+            raise UsageError(f"bad --set value {p!r}; use key=value")
+        k, v = p.split("=", 1)
+        try:
+            cfg[k] = json.loads(v)
+        except (json.JSONDecodeError, ValueError):
+            cfg[k] = v
+    return cfg
+
+
+def check_platform(name):
+    if name not in SUPPORTED_PLATFORMS:
+        raise UsageError(
+            f"unknown platform {name!r} (supported: {', '.join(SUPPORTED_PLATFORMS)})")
+    return name
+
+
+# ---------------------------------------------------------- content gates ---
+
+def content_gates(platform, account_label, text, kind):
+    """Run the content gates on draft text (post drafts, comments).
+
+    Order: secrets (hard refuse) -> identity (hard refuse on breaks) ->
+    voice (warn only). Returns a list of warning strings. Raises Refused
+    (logged to refusals.jsonl) on secret or identity violations.
+    """
+    warnings = []
+    found, pat = secrets_mod.contains_secret(text or "")
+    if found:
+        reason = (f"security: draft contains secret-shaped content ({pat}); "
+                  f"the agent never writes secrets into content")
+        log_refusal(kind, platform, "", reason)
+        raise Refused(reason)
+    ident = identity_mod.check_identity(text or "", account_label, home_dir())
+    if not ident["pass"]:
+        reason = "identity: " + "; ".join(ident["reasons"])
+        log_refusal(kind, platform, "", reason)
+        raise Refused(reason)
+    for adv in ident["advisories"]:
+        warnings.append(f"identity note: {adv}")
+    v = voice_check_mod.check_text(text or "", platform)
+    if not v["human"]:
+        warnings.append(f"voice warning: AI-ness score {v['score']}/100 "
+                        f"(threshold {voice_check_mod.WARN_THRESHOLD}) — " +
+                        "; ".join(v["suggestions"][:2]))
+    return warnings
+
+
+def _warn(warnings):
+    for w in warnings:
+        print(f"WARNING: {w}")
+
+
+# --------------------------------------------------------------- accounts ---
+
+def cmd_accounts(args):
+    accounts = load_json("accounts.json", [])
+    if args.op == "list":
+        if not accounts:
+            print("no accounts configured")
+            return
+        for a in accounts:
+            label = f" ({a['label']})" if a.get("label") else ""
+            print(f"{a['username']}{label} [{a['platform']}] added {a['added'][:10]}")
+    elif args.op == "add":
+        check_platform(args.platform)
+        if any(a["username"] == args.username and a["platform"] == args.platform
+               for a in accounts):
+            raise UsageError(f"account {args.username!r} already added for {args.platform}")
+        accounts.append({
+            "platform": args.platform,
+            "username": args.username,
+            "label": args.label or "",
+            "added": utcnow(),
+        })
+        save_json("accounts.json", accounts)
+        print(f"added {args.username} [{args.platform}]"
+              + (f" as {args.label!r}" if args.label else "")
+              + " (no credentials stored)")
+        _backup_trigger("account_settings_changed", files=["accounts.json"],
+                        note=f"account {args.username}/{args.platform} added")
+    elif args.op == "remove":
+        before = len(accounts)
+        accounts = [a for a in accounts
+                    if not (a["username"] == args.ref or a.get("label") == args.ref)]
+        if len(accounts) == before:
+            raise UsageError(f"unknown account {args.ref!r}")
+        save_json("accounts.json", accounts)
+        print(f"removed {args.ref}")
+        _backup_trigger("account_settings_changed", files=["accounts.json"],
+                        note=f"account {args.ref} removed")
+    elif args.op == "show":
+        a = resolve_account(args.ref)
+        adapter = get_adapter(a["platform"]).to_dict()
+        print(f"username : {a['username']}")
+        print(f"platform : {a['platform']} ({adapter['display']})")
+        print(f"label    : {a.get('label') or '-'}")
+        print(f"added    : {a['added']}")
+        print(f"auth     : {adapter['auth']}")
+
+
+# ------------------------------------------------------------------ watch ---
+
+def cmd_watch(args):
+    registry = load_json("watchers.json", {})
+    if args.op == "list":
+        if not registry:
+            print("no watchers configured")
+            return
+        for wid, rec in registry.items():
+            state = "enabled" if rec.get("enabled") else "stopped"
+            print(f"{wid} [{rec['type']}] {rec['platform']}/{rec['account']} ({state})")
+    elif args.op == "start":
+        if args.type not in REGISTRY:
+            raise UsageError(
+                f"unknown watcher type {args.type!r} (see: {', '.join(sorted(REGISTRY))})")
+        check_platform(args.platform)
+        acct = resolve_account(args.account)
+        try:
+            tos_mod.check_tos(args.platform, "automated_data_collection")
+        except tos_mod.ToSRefusal as e:
+            log_refusal("watch", args.platform, args.type, f"ToS: {e}")
+            raise
+        config = parse_kv(args.set)
+        cls = REGISTRY[args.type]
+        probe = cls("probe", args.platform, acct["username"], config,
+                    home_dir(), args.fixture)
+        errors = probe.validate_config()
+        if errors:
+            raise UsageError("invalid config: " + "; ".join(errors))
+        wid = args.id or new_id("w")
+        if wid in registry:
+            raise UsageError(f"watcher id {wid!r} already exists")
+        registry[wid] = {
+            "id": wid, "type": args.type, "platform": args.platform,
+            "account": acct["username"], "config": config,
+            "fixture": args.fixture, "enabled": True, "started": utcnow(),
+        }
+        save_json("watchers.json", registry)
+        print(f"started watcher {wid} [{args.type}] on {args.platform}/{acct['username']}")
+    elif args.op == "stop":
+        rec = registry.get(args.id)
+        if not rec:
+            raise UsageError(f"unknown watcher {args.id!r}")
+        rec["enabled"] = False
+        save_json("watchers.json", registry)
+        print(f"stopped watcher {args.id}")
+    elif args.op == "status":
+        ids = [args.id] if args.id else sorted(registry)
+        if not ids:
+            print("no watchers configured")
+            return
+        for wid in ids:
+            rec = registry.get(wid)
+            if not rec:
+                raise UsageError(f"unknown watcher {wid!r}")
+            sp = _path(f"watchers/{wid}.json")
+            st = {}
+            if os.path.exists(sp):
+                with open(sp, encoding="utf-8") as fh:
+                    st = json.load(fh).get("state", {})
+            print(f"{wid} [{rec['type']}] {rec['platform']}/{rec['account']}")
+            print(f"  enabled={rec.get('enabled')} polls={st.get('polls', 0)} "
+                  f"events={st.get('events_found', 0)} last_poll={st.get('last_poll')}")
+    elif args.op == "run":
+        rec = registry.get(args.id)
+        if not rec:
+            raise UsageError(f"unknown watcher {args.id!r}")
+        if not rec.get("enabled"):
+            raise UsageError(f"watcher {args.id} is stopped")
+        from core.watcher_engine import WatcherEngine
+        home = home_dir()
+
+        def _tos_check(platform):
+            try:
+                tos_mod.check_tos(platform, "automated_data_collection")
+            except tos_mod.ToSRefusal as e:
+                log_refusal("watch", platform, args.id, f"ToS: {e}")
+                raise
+
+        engine = WatcherEngine(home, tos_check=_tos_check)
+        hb_cfg = hb.load_config()
+        try:
+            events = hb.watch_run(hb_cfg, rec["id"],
+                                  lambda: engine.poll(args.id))
+        except (WatcherError, OSError) as e:
+            raise UsageError(str(e))
+        print(f"poll ok: {len(events)} new event(s)")
+        for ev in events:
+            pa = ev.get("proposed_action")
+            prop = f" -> proposes: {pa['action']}" if pa else ""
+            print(f"  [{ev['severity']}] {ev['kind']}: {ev['summary'][:120]}{prop}")
+        # Crisis watcher auto-pause: opt-in ONLY (auto_pause defaults off).
+        # A false positive must never silence the account on its own.
+        if rec["type"] == "crisis":
+            cfg = engine._instantiate(rec).effective_config()
+            spikes = [e for e in events if e.get("kind") == "crisis:spike"]
+            if spikes and cfg.get("auto_pause") and not crisis_mod.is_active(home_dir()):
+                st = crisis_mod.activate(
+                    home_dir(),
+                    f"auto-pause: crisis watcher {rec['id']} detected a negative spike",
+                    hold_fn=_crisis_hold)
+                hbc = hb.load_config()
+                hb.ping_path(hbc.base_url, "crisis", "auto-on", timeout=hbc.timeout)
+                hb.record_local("crisis", "crisis/auto-on", True,
+                                f"{len(spikes)} spike event(s)")
+                print(f"AUTO-PAUSE: crisis mode ON ({len(st['held'])} item(s) held). "
+                      f"Run `crisis off` explicitly to resume.")
+    elif args.op == "register-platform":
+        check_platform(args.platform)
+        from core.watcher_engine import WatcherEngine, DuplicateWatcherError
+        import importlib
+        try:
+            pkg = importlib.import_module(
+                f"platforms.{args.platform}.watchers")
+        except ModuleNotFoundError:
+            raise UsageError(
+                f"platform {args.platform!r} has no watchers package")
+        engine = WatcherEngine(home_dir())
+        try:
+            recs = pkg.register(engine, account=args.account,
+                                fixtures_dir=args.fixtures_dir)
+        except DuplicateWatcherError as e:
+            raise UsageError(str(e))
+        print(f"registered {len(recs)} watcher(s) for {args.platform}:")
+        for r in recs:
+            print(f"  {r['id']} [{r['type']}]")
+    elif args.op == "events":
+        events = read_events()
+        if args.watcher:
+            events = [e for e in events if e.get("watcher") == args.watcher]
+        events = events[-args.limit:]
+        if not events:
+            print("no events recorded")
+            return
+        for ev in events:
+            print(f"{ev['timestamp']} {ev['watcher']} [{ev['kind']}] {ev['summary'][:120]}")
+
+
+# ------------------------------------------------------------------- post ---
+
+DEFAULT_VIDEO_FOR = {
+    "tiktok": "tiktok:feed",
+    "youtube": "youtube:long-form",
+    "instagram": "instagram:reels",
+    "facebook": "facebook:feed",
+    "x": "x:feed",
+    "reddit": "reddit:feed",
+}
+
+
+def _require_ffprobe():
+    path = vff.ffprobe()
+    if not path:
+        raise UsageError("ffprobe not found — see video/SETUP.md for install steps")
+    return path
+
+
+def video_preflight_gate(input_path, target):
+    """Validate a video file against a placement spec.
+
+    Prints the check table. Returns True on PASS. Raises UsageError on FAIL
+    with concrete fixes (fail-closed: a wrongly-sized video never posts).
+    """
+    _require_ffprobe()
+    inf = vff.info(input_path)
+    res = vfit.preflight(inf, target)
+    print(f"== video preflight: {res['target']} ==")
+    for c in res["checks"]:
+        mark = "PASS" if c["ok"] else "FAIL"
+        print(f"  [{mark}] {c['name']}: {c['detail']}")
+    for a in res["advisories"]:
+        print(f"  [info] {a}")
+    if res["passed"]:
+        print("video preflight PASSED")
+        return True
+    print("video preflight FAILED:", file=sys.stderr)
+    for f in res["fixes"]:
+        print(f"  - {f}", file=sys.stderr)
+    raise UsageError("video does not meet the target spec — fix it and re-run")
+
+
+def cmd_post(args):
+    queue = load_json("queue.json", [])
+    if args.op == "draft":
+        check_platform(args.platform)
+        acct = resolve_account(args.account)
+        label = acct.get("label") or acct["username"]
+        _warn(content_gates(args.platform, label, args.text or "", "post_draft"))
+        if args.video:
+            target = DEFAULT_VIDEO_FOR.get(args.platform, f"{args.platform}:feed")
+            video_preflight_gate(args.video, target)
+        pid = args.id or new_id("p")
+        queue.append({
+            "id": pid, "platform": args.platform, "account": acct["username"],
+            "text": args.text, "media": args.media or "", "video": args.video or "",
+            "status": "draft", "created": utcnow(),
+        })
+        save_json("queue.json", queue)
+        print(f"drafted post {pid} for {args.platform}/{acct['username']}")
+        _backup_trigger("post_created", files=["queue.json"],
+                        note=f"post {pid} drafted")
+    elif args.op == "list":
+        items = queue
+        if args.status:
+            items = [q for q in items if q["status"] == args.status]
+        if not items:
+            print("no posts")
+            return
+        for q in items:
+            print(f"{q['id']} [{q['status']}] {q['platform']}/{q['account']}: "
+                  f"{q['text'][:80]}")
+    elif args.op in ("queue", "approve"):
+        q = next((x for x in queue if x["id"] == args.id), None)
+        if not q:
+            raise UsageError(f"unknown post {args.id!r}")
+        if args.op == "queue":
+            if q["status"] != "draft":
+                raise UsageError(f"post {args.id} is {q['status']}, not draft")
+            q["status"] = "queued"
+            print(f"post {args.id} queued (still needs approval before any publishing)")
+        else:
+            if q["status"] not in ("draft", "queued"):
+                raise UsageError(f"post {args.id} is {q['status']}")
+            guard_acting(q["platform"], "post")
+            mission = autonomous_decision(q["platform"], "post", q.get("text", ""))
+            auto_via = ""
+            if mission:
+                auto_via = f"mission {mission!r}"
+            elif approvals_queue.per_type_policy(get_policy(), "publish") == "auto":
+                auto_via = "approval policy (per_type: auto)"
+            qitem = _queue_item_for(
+                "publish", q["platform"], q["account"],
+                f"publish post {args.id}",
+                {"post_id": args.id, "text": (q.get("text") or "")[:200],
+                 "video": q.get("video", "")},
+                reason=f"post publish ({auto_via})" if auto_via else "post publish",
+                ref={"store": "queue.json", "id": q["id"]},
+                status="pending")
+            # persist the auto flags on the underlying record first; the
+            # queue approve() below then flips it to approved via _apply_approval
+            q["auto_approved"] = bool(auto_via)
+            q["mission"] = mission
+            save_json("queue.json", queue)
+            # `post approve` IS the decision (explicit human, or auto via
+            # mission/policy): approve the queue item immediately so the
+            # queue stays the single audit trail.
+            backup_mod.recovery_point(
+                home_dir(), note=f"pre-publish recovery point for post {args.id}")
+            try:
+                approvals_queue.approve(home_dir(), qitem["id"],
+                                        apply_fn=_apply_approval,
+                                        decided_by=mission or "user")
+            except (KeyError, ValueError) as e:
+                raise UsageError(str(e))
+            # refresh from the store (the queue flip wrote it)
+            queue = load_json("queue.json", [])
+            q = next((x for x in queue if x["id"] == args.id), None)
+            record_action(q["platform"], "post")
+            if auto_via:
+                print(f"post {args.id} AUTO-APPROVED ({auto_via}) "
+                      f"for {q['platform']}/{q['account']}")
+            else:
+                print(f"post {args.id} APPROVED for {q['platform']}/{q['account']} "
+                      f"(via approval {qitem['id']})")
+            print("DRY-RUN: publish this in a real browser session; the CLI never posts by itself.")
+        save_json("queue.json", queue)
+
+
+# ----------------------------------------------------------------- engage ---
+
+ENGAGE_ACTIONS = ["like", "comment", "follow", "retweet"]
+
+
+def _post_info_from_args(args):
+    """Build a post dict from engage args for interest scoring. Returns None
+    when no post details were supplied (unscored like)."""
+    info = {}
+    if args.author:
+        info["author"] = args.author
+    if args.text and args.op == "like":
+        info["text"] = args.text
+    if args.hashtags:
+        info["hashtags"] = [h.strip().lstrip("#") for h in args.hashtags.split(",") if h.strip()]
+    if args.likes_count is not None:
+        info["likes"] = args.likes_count
+    if args.comments_count is not None:
+        info["comments"] = args.comments_count
+    return info or None
+
+
+def cmd_engage(args):
+    actions = load_json("actions.json", [])
+    if args.op in ENGAGE_ACTIONS:
+        check_platform(args.platform)
+        acct = resolve_account(args.account)
+        if args.op == "comment" and not args.text:
+            raise UsageError("comment requires --text")
+        try:
+            guard_acting(args.platform, args.op)
+        except RateLimited as e:
+            _queue_rate_limited(args.op, args.platform, acct["username"],
+                                f"{args.op} -> {args.target}",
+                                {"target": args.target,
+                                 "text": args.text or ""})
+            raise
+
+        # --- selective engagement: likes only for interesting posts ---
+        text_for_scope = args.text or ""
+        if args.op == "like":
+            post = _post_info_from_args(args)
+            if post is not None:
+                score, reasons, interesting = interest_mod.score_post(post)
+                if not interesting:
+                    reason = (f"not interesting (score {score} < "
+                              f"threshold {interest_mod.load_profile().get('threshold')})")
+                    log_refusal("like", args.platform, args.target, reason)
+                    raise Refused(f"selective engagement: {reason}: {'; '.join(reasons)}")
+                print(f"interest score {score}: {'; '.join(reasons[:3])}")
+            check_like_guards(args.platform, args.author or "")
+        if args.op == "follow":
+            check_follow_guards(args.platform)
+        if args.op == "comment":
+            label = acct.get("label") or acct["username"]
+            _warn(content_gates(args.platform, label, args.text or "",
+                                "engage_comment"))
+
+        # --- autonomous mode: auto-approve in scope, block out of scope ---
+        mission = autonomous_decision(args.platform, args.op, text_for_scope)
+        if mission:
+            status, auto, auto_via = "approved", True, f"mission {mission!r}"
+        elif approvals_queue.per_type_policy(get_policy(), args.op) == "auto":
+            status, auto, auto_via = "approved", True, "approval policy (per_type: auto)"
+        else:
+            status, auto, auto_via = "proposed", False, ""
+
+        aid = new_id("a")
+        actions.append({
+            "id": aid, "action": args.op, "platform": args.platform,
+            "account": acct["username"], "target": args.target,
+            "text": args.text or "", "status": status,
+            "auto_approved": auto, "mission": mission,
+            "dry_run": True, "created": utcnow(),
+            **({"approved_at": utcnow(), "approved_at_ts": time.time()} if auto else {}),
+        })
+        qitem = _queue_item_for(
+            args.op, args.platform, acct["username"],
+            f"{args.op} -> {args.target}",
+            {"target": args.target, "text": args.text or ""},
+            reason=f"engagement proposal ({auto_via})" if auto else "engagement proposal",
+            ref={"store": "actions.json", "id": aid},
+            status="approved" if auto else "pending")
+        record_action(args.platform, args.op)
+        if args.op == "like":
+            record_like(args.platform, args.author or "", args.target)
+        if args.op == "follow":
+            record_follow(args.platform, args.target)
+        save_json("actions.json", actions)
+        if auto:
+            print(f"AUTO-APPROVED {aid} ({auto_via}): "
+                  f"{args.op} -> {args.target} [{args.platform}/{acct['username']}]")
+            print("DRY-RUN: perform it in a real browser session, then `engage done`.")
+        else:
+            print(f"DRY-RUN proposal {aid}: {args.op} -> {args.target} "
+                  f"[{args.platform}/{acct['username']}]")
+            print(f"Queued for human approval as {qitem['id']} "
+                  f"(`approvals list`, `approvals approve {qitem['id']}`).")
+            print("No action was taken. Run `engage approve` to approve it explicitly.")
+    elif args.op == "list":
+        items = actions
+        if args.status:
+            items = [a for a in items if a["status"] == args.status]
+        if not items:
+            print("no engagement actions")
+            return
+        for a in items:
+            extra = f" {a['text'][:60]!r}" if a.get("text") else ""
+            print(f"{a['id']} [{a['status']}] {a['action']} -> {a['target']}"
+                  f" [{a['platform']}/{a['account']}] dry_run={a['dry_run']}{extra}")
+    elif args.op == "approve":
+        a = next((x for x in actions if x["id"] == args.id), None)
+        if not a:
+            raise UsageError(f"unknown action {args.id!r}")
+        if a["status"] != "proposed":
+            raise UsageError(f"action {args.id} is {a['status']}, not proposed")
+        guard_acting(a["platform"], a["action"])
+        qitem = approvals_queue.find_by_ref(home_dir(), "actions.json", a["id"])
+        if qitem is None:
+            # legacy proposal predating the unified queue: create the item now
+            qitem = _queue_item_for(
+                a["action"], a["platform"], a["account"],
+                f"{a['action']} -> {a['target']}",
+                {"target": a["target"], "text": a.get("text", "")},
+                reason="legacy proposal adopted into the unified queue",
+                ref={"store": "actions.json", "id": a["id"]})
+        try:
+            approvals_queue.approve(home_dir(), qitem["id"], apply_fn=_apply_approval)
+        except (KeyError, ValueError) as e:
+            raise UsageError(str(e))
+        print(f"action {args.id} APPROVED: {a['action']} -> {a['target']}")
+        print("Perform it in a real browser session, then log it with `engage done`.")
+    elif args.op == "done":
+        a = next((x for x in actions if x["id"] == args.id), None)
+        if not a:
+            raise UsageError(f"unknown action {args.id!r}")
+        if a["status"] != "approved":
+            raise UsageError(f"action {args.id} is {a['status']}; approve it first")
+        if not approval_valid(a):
+            a["status"] = "expired"
+            save_json("actions.json", actions)
+            raise Refused(f"approval for {args.id} expired "
+                          f"({get_policy()['approvals']['expiry_hours']}h); re-approve")
+        a["status"] = "done"
+        a["result"] = args.result or "performed in browser session"
+        a["done_at"] = utcnow()
+        save_json("actions.json", actions)
+        print(f"action {args.id} logged as done: {a['result']}")
+
+
+# --------------------------------------------------------------- research ---
+
+def cmd_research(args):
+    plats = [p.strip() for p in args.platforms.split(",")] if args.platforms else SUPPORTED_PLATFORMS
+    for p in plats:
+        check_platform(p)
+    words = [w for w in args.topic.lower().replace("-", " ").split() if w]
+    hashtags = ["#" + "".join(words), "#" + words[0]] if words else []
+    queries = {}
+    for p in plats:
+        queries[p] = [
+            args.topic,
+            f"{args.topic} tutorial",
+            f"{args.topic} breakdown",
+            " ".join(hashtags),
+        ]
+    plan = {
+        "topic": args.topic,
+        "platforms": plats,
+        "queries": queries,
+        "hashtags": hashtags,
+        "suggested_watchers": [
+            {"type": "feed", "note": f"feed watcher with keywords={words}"},
+            {"type": "follow", "note": "follow watcher on hashtags " + ", ".join(hashtags)},
+            {"type": "channel", "note": "channel watcher on relevant channels found during research"},
+        ],
+        "created": utcnow(),
+    }
+    plans = load_json("research.json", [])
+    plans.append(plan)
+    save_json("research.json", plans)
+    print(f"research plan for {args.topic!r} (offline: queries to run in browser/API sessions)")
+    for p in plats:
+        print(f"  {p}:")
+        for q in queries[p]:
+            print(f"    - {q}")
+    print(f"  hashtags: {', '.join(hashtags)}")
+    print("  suggested watchers:")
+    for s in plan["suggested_watchers"]:
+        print(f"    - [{s['type']}] {s['note']}")
+
+
+# -------------------------------------------------------------- analytics ---
+
+def cmd_analytics(args):
+    events = read_events()
+    if args.watcher:
+        events = [e for e in events if e.get("watcher") == args.watcher]
+    if args.days is not None:
+        cutoff = time.time() - args.days * 86400
+        events = [e for e in events
+                  if datetime.fromisoformat(e["timestamp"]).timestamp() >= cutoff]
+    print(f"events: {len(events)}")
+    if not events:
+        return
+    by_kind, by_platform, by_watcher = {}, {}, {}
+    for e in events:
+        by_kind[e.get("kind", "?")] = by_kind.get(e.get("kind", "?"), 0) + 1
+        by_platform[e.get("platform", "?")] = by_platform.get(e.get("platform", "?"), 0) + 1
+        by_watcher[e.get("watcher", "?")] = by_watcher.get(e.get("watcher", "?"), 0) + 1
+    print("by kind:")
+    for k, v in sorted(by_kind.items(), key=lambda x: -x[1]):
+        print(f"  {k}: {v}")
+    print("by platform:")
+    for k, v in sorted(by_platform.items(), key=lambda x: -x[1]):
+        print(f"  {k}: {v}")
+    print("by watcher:")
+    for k, v in sorted(by_watcher.items(), key=lambda x: -x[1]):
+        print(f"  {k}: {v}")
+    proposed = [e for e in events if e.get("proposed_action")]
+    print(f"events proposing actions: {len(proposed)}")
+    actions = load_json("actions.json", [])
+    by_status = {}
+    for a in actions:
+        by_status[a["status"]] = by_status.get(a["status"], 0) + 1
+    print(f"engagement actions: {len(actions)} " +
+          ", ".join(f"{k}={v}" for k, v in sorted(by_status.items())))
+
+
+# ---------------------------------------------------------------- mission ---
+
+def cmd_mission(args):
+    if args.op == "create":
+        platforms = [p.strip() for p in args.platforms.split(",") if p.strip()]
+        for p in platforms:
+            check_platform(p)
+        topics = [t.strip() for t in (args.topics or "").split(",") if t.strip()]
+        actions = [a.strip() for a in args.actions.split(",") if a.strip()]
+        limits = parse_kv(args.limit)
+        path = missions_mod.create_mission(args.name, platforms, topics, actions,
+                                           limits, args.brief or "")
+        print(f"mission {args.name!r} created at {path}")
+        print(f"  platforms: {', '.join(platforms)}")
+        print(f"  topics: {', '.join(topics) or '-'}")
+        print(f"  allowed actions: {', '.join(actions)}")
+        print("Note: a mission alone grants nothing. Use `autonomy grant` to activate it.")
+    elif args.op == "list":
+        ms = missions_mod.list_missions()
+        if not ms:
+            print("no missions defined")
+            return
+        for m in ms:
+            print(f"{m['name']}: platforms=[{', '.join(m['platforms'])}] "
+                  f"actions=[{', '.join(m['allowed_actions'])}]")
+    elif args.op == "show":
+        p = missions_mod.mission_path(args.name)
+        if not os.path.exists(p):
+            raise UsageError(f"unknown mission {args.name!r}")
+        meta, body = missions_mod.parse_mission_file(p)
+        print(f"name: {meta['name']}")
+        print(f"platforms: {', '.join(meta['platforms'])}")
+        print(f"topics: {', '.join(meta.get('topics') or [])}")
+        print(f"allowed actions: {', '.join(meta['allowed_actions'])}")
+        print(f"limits: {meta.get('limits') or {}}")
+        print("---")
+        print(body.strip())
+
+
+# --------------------------------------------------------------- autonomy ---
+
+def cmd_autonomy(args):
+    if args.op == "grant":
+        meta = missions_mod.get_mission(args.mission)
+        if meta is None:
+            raise UsageError(f"unknown mission {args.mission!r}; see `mission list`")
+        if not args.confirm:
+            print("AUTONOMY GRANT — review the scope before confirming:")
+            print(f"  mission: {meta['name']}")
+            print(f"  platforms: {', '.join(meta['platforms'])}")
+            print(f"  topics: {', '.join(meta.get('topics') or [])}")
+            print(f"  allowed actions: {', '.join(meta['allowed_actions'])}")
+            print(f"  limits: {meta.get('limits') or {}}")
+            print("  HARD BLOCKS (never auto-approved): profile changes, DMs, "
+                  "off-mission platforms/topics.")
+            print()
+            print("To grant, re-run with --confirm. You can revoke anytime with "
+                  "`autonomy revoke`.")
+            raise UsageError("grant requires --confirm (explicit user confirmation)")
+        granted = autonomy_mod.grant(args.mission)
+        print(f"autonomy GRANTED for mission {granted['name']!r} at {utcnow()}")
+        print("The agent may now act without per-action approval INSIDE mission scope only.")
+    elif args.op == "revoke":
+        autonomy_mod.revoke()
+        print("autonomy revoked. All acting operations need per-action approval again.")
+    elif args.op == "status":
+        st = autonomy_mod.load_state()
+        if not st.get("granted"):
+            print("autonomy: not granted")
+            return
+        m = autonomy_mod.active_mission()
+        print(f"autonomy: GRANTED for mission {st.get('mission')!r} "
+              f"since {st.get('granted_at')}")
+        if m:
+            print(f"  platforms: {', '.join(m['platforms'])}; "
+                  f"actions: {', '.join(m['allowed_actions'])}")
+
+
+# ---------------------------------------------------------------- profile ---
+
+PROFILE_FIELDS = ["display_name", "username", "bio", "avatar"]
+
+
+def _profiles():
+    return load_json("profiles.json", {"accounts": {}, "proposals": []})
+
+
+def cmd_profile(args):
+    data = _profiles()
+    if args.op == "view":
+        acct = resolve_account(args.account)
+        prof = data["accounts"].get(acct["username"], {})
+        print(f"account : {acct['username']} [{acct['platform']}]")
+        for f in PROFILE_FIELDS:
+            print(f"{f:13}: {prof.get(f, '-')}")
+        pending = [p for p in data["proposals"]
+                   if p["account"] == acct["username"] and p["status"] == "proposed"]
+        if pending:
+            print(f"pending proposals: {', '.join(p['id'] for p in pending)}")
+    elif args.op == "update":
+        acct = resolve_account(args.account)
+        changes = {}
+        if args.display_name is not None:
+            changes["display_name"] = args.display_name
+        if args.username is not None:
+            changes["username"] = args.username
+        if args.bio is not None:
+            changes["bio"] = args.bio
+        if args.avatar is not None:
+            changes["avatar"] = args.avatar
+        if not changes:
+            raise UsageError("nothing to change; pass --display-name/--username/--bio/--avatar")
+        pid = new_id("pr")
+        data["proposals"].append({
+            "id": pid, "account": acct["username"], "platform": acct["platform"],
+            "changes": changes, "status": "proposed",
+            "dry_run": True, "created": utcnow(),
+        })
+        save_json("profiles.json", data)
+        print(f"profile change {pid} PROPOSED for {acct['username']}: {changes}")
+        print("HARD RULE: profile changes ALWAYS need an explicit `profile approve` —")
+        print("autonomous mode can never auto-approve them.")
+    elif args.op == "list":
+        items = data["proposals"]
+        if args.status:
+            items = [p for p in items if p["status"] == args.status]
+        if not items:
+            print("no profile proposals")
+            return
+        for p in items:
+            print(f"{p['id']} [{p['status']}] {p['account']}: {p['changes']}")
+    elif args.op == "approve":
+        p = next((x for x in data["proposals"] if x["id"] == args.id), None)
+        if not p:
+            raise UsageError(f"unknown profile proposal {args.id!r}")
+        if p["status"] != "proposed":
+            raise UsageError(f"proposal {args.id} is {p['status']}, not proposed")
+        # NOTE: autonomy is deliberately NOT consulted here. This command IS the
+        # explicit user approval, and there is no code path that auto-approves
+        # profile changes.
+        guard_acting(p["platform"], "profile")
+        p["status"] = "approved"
+        p["approved_at"] = utcnow()
+        p["approved_at_ts"] = time.time()
+        record_action(p["platform"])
+        save_json("profiles.json", data)
+        print(f"profile change {args.id} APPROVED for {p['account']}")
+        print("Apply it in a real browser session, then log it with `profile done`.")
+    elif args.op == "done":
+        p = next((x for x in data["proposals"] if x["id"] == args.id), None)
+        if not p:
+            raise UsageError(f"unknown profile proposal {args.id!r}")
+        if p["status"] != "approved":
+            raise UsageError(f"proposal {args.id} is {p['status']}; approve it first")
+        if not approval_valid(p):
+            p["status"] = "expired"
+            save_json("profiles.json", data)
+            raise Refused(f"approval for {args.id} expired; re-approve")
+        acct_rec = data["accounts"].setdefault(p["account"], {})
+        acct_rec.update(p["changes"])
+        p["status"] = "done"
+        p["result"] = args.result or "applied in browser session"
+        p["done_at"] = utcnow()
+        save_json("profiles.json", data)
+        print(f"profile change {args.id} logged as done: {p['result']}")
+
+
+# -------------------------------------------------------------- heartbeat ---
+
+def _watcher_state_last_poll(wid):
+    sp = _path(f"watchers/{wid}.json")
+    if not os.path.exists(sp):
+        return 0
+    try:
+        with open(sp, encoding="utf-8") as fh:
+            ts = json.load(fh).get("state", {}).get("last_poll")
+        if not ts:
+            return 0
+        return datetime.fromisoformat(ts).timestamp()
+    except (ValueError, OSError, KeyError):
+        return 0
+
+
+def cmd_heartbeat(args):
+    cfg = hb.load_config()
+    if args.op == "status":
+        print(f"heartbeat: {'enabled' if cfg.enabled else 'disabled'}")
+        print(f"base_url: {cfg.base_url or '(log-only mode — no URL configured)'}")
+        print(f"supervisor: every {cfg.supervisor_interval}s -> {cfg.supervisor_name}")
+        recent = hb.recent_pings(limit=10)
+        if not recent:
+            print("no pings recorded yet")
+            return
+        print("recent pings:")
+        for r in recent:
+            mark = "ok " if r["ok"] else "FAIL"
+            print(f"  [{mark}] {r['timestamp']} {r['name']} {r['path']} — {r['detail']}")
+    elif args.op == "test":
+        if not cfg.base_url:
+            print("log-only mode: no base_url configured, pings are recorded locally.")
+            print(f"recorded pings: {len(hb.recent_pings(limit=1000))}")
+            return
+        ok, detail = hb.ping(cfg.base_url, timeout=cfg.timeout, name="heartbeat-test")
+        print(f"ping {cfg.base_url}: {'OK' if ok else 'FAILED'} — {detail}")
+        if not ok:
+            raise UsageError("heartbeat test ping failed")
+    elif args.op == "daemon":
+        interval = args.interval or cfg.supervisor_interval
+        only = [w.strip() for w in args.watchers.split(",")] if args.watchers else None
+        poll_interval = get_policy()["watchers"]["poll_interval_seconds"]
+        tick = 0
+        while True:
+            tick += 1
+            if cfg.enabled and cfg.supervisor_enabled:
+                hb.ping_path(cfg.base_url, cfg.supervisor_name, timeout=cfg.timeout)
+            registry = load_json("watchers.json", {})
+            for wid in sorted(registry):
+                rec = registry[wid]
+                if only and wid not in only:
+                    continue
+                if not rec.get("enabled"):
+                    continue
+                if time.time() - _watcher_state_last_poll(wid) < poll_interval:
+                    continue
+                cls = REGISTRY[rec["type"]]
+                w = cls(rec["id"], rec["platform"], rec["account"], rec["config"],
+                        home_dir(), rec.get("fixture"))
+                try:
+                    tos_mod.check_tos(rec["platform"], "automated_data_collection")
+                except tos_mod.ToSRefusal as e:
+                    log_refusal("watch", rec["platform"], rec["id"], f"ToS: {e}")
+                    print(f"[tick {tick}] watcher {wid}: REFUSED (ToS): {e}")
+                    continue
+                try:
+                    hb.watch_run(cfg, rec["id"], w.check)
+                    print(f"[tick {tick}] watcher {wid}: poll ok")
+                except Exception as e:
+                    print(f"[tick {tick}] watcher {wid}: FAILED ({e})")
+            if args.once:
+                break
+            time.sleep(interval)
+
+
+# ----------------------------------------------------------------- doctor ---
+
+def cmd_growth(args):
+    if args.op == "goals":
+        if args.gop == "set":
+            check_platform(args.platform)
+            goal = growth_goals.set_goal(
+                home_dir(), args.platform, args.account,
+                args.target_followers, args.deadline,
+                label=args.label, starting_followers=args.starting_followers)
+            print(f"goal {goal['id']}: {goal['label']} "
+                  f"({args.platform}/{args.account})")
+        elif args.gop == "list":
+            goals = growth_goals.load_goals(home_dir())
+            if args.platform:
+                goals = [g for g in goals if g["platform"] == args.platform]
+            if not goals:
+                print("no goals yet — run `growth goals set`")
+                return
+            for g in goals:
+                prog = growth_goals.progress(home_dir(), g)
+                growth_goals.check_milestones(home_dir(), g, prog)
+                rec = next((x for x in growth_goals.load_goals(home_dir())
+                            if x["id"] == g["id"]), g)
+                print(f"{g['id']} [{g['platform']}/{g['account']}] {g['label']}: "
+                      f"{prog['current']}/{prog['target']} followers "
+                      f"({prog['percent']}% of target, {prog['remaining']} to go, "
+                      f"deadline {prog['deadline']})")
+                for m in rec.get("milestones_hit", []):
+                    print(f"    milestone: {m}%")
+    elif args.op == "audit":
+        check_platform(args.platform)
+        inputs = {
+            "posts_per_week": args.posts_per_week,
+            "avg_views": args.avg_views,
+            "followers": args.followers,
+            "avg_likes": args.avg_likes,
+            "avg_comments": args.avg_comments,
+            "niche": args.niche,
+            "has_bio": args.has_bio, "has_link": args.has_link,
+            "has_avatar": args.has_avatar, "has_cta": args.has_cta,
+        }
+        res = growth_audit_mod.audit(args.platform, args.account, inputs)
+        for name, s in res["pillars"].items():
+            score = "?" if s["score"] is None else f"{s['score']}/100"
+            print(f"{name:18s} {score:8s} {s['detail']}")
+        ov = res["overall"]
+        print(f"overall: {'?' if ov is None else f'{ov}/100'}")
+        print("fixes (worst first):")
+        for f in res["fixes"]:
+            print(f"  - {f}")
+    elif args.op == "playbook":
+        pb = growth_strategy.playbook(args.platform)
+        print(f"== growth playbook: {args.platform} ==")
+        for k, v in pb.items():
+            print(f"\n[{k}]")
+            if isinstance(v, list):
+                for item in v:
+                    print(f"  - {item}")
+            else:
+                print(f"  {v}")
+
+
+def cmd_youtube(args):
+    if args.op == "preflight":
+        meta = {
+            "title": args.title, "thumbnail": args.thumbnail,
+            "hook_30s": args.hook_30s, "resolution": args.resolution == "1080p" or args.resolution == "4k",
+            "audio": args.audio, "retention_edit": args.retention_edit,
+            "description": args.description, "end_screen": args.end_screen,
+            "captions": args.captions,
+        }
+        print("quality checklist:")
+        for item in yt_mod.QUALITY_CHECKLIST:
+            mark = "OK " if meta.get(item["key"]) else ("REQ" if item["required"] else "opt")
+            print(f"  [{mark}] {item['label']}")
+        ok, missing = yt_mod.preflight(meta)
+        if not ok:
+            print("REFUSED (preflight): missing required fields: "
+                  + ", ".join(missing), file=sys.stderr)
+            sys.exit(2)
+        print("preflight passed — required quality fields present")
+        if args.video:
+            target = f"youtube:{args.placement}"
+            video_preflight_gate(args.video, target)
+    elif args.op == "titles":
+        variants = yt_mod.title_variants(args.idea, args.keyword or "")
+        for v in variants:
+            print(f"[{v['score']:3d}] {v['title']}   ({v['formula']})")
+    elif args.op == "description":
+        link_pairs = []
+        for pair in args.link or []:
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                link_pairs.append((k, v))
+        tags = [h.strip().lstrip("#") for h in (args.hashtags or "").split(",")
+                if h.strip()]
+        desc = yt_mod.build_description(
+            args.title, summary=args.summary,
+            timestamps=(args.timestamps.split(",")) if args.timestamps else [],
+            links=link_pairs, cta=args.cta, hashtags=tags)
+        print(desc)
+    elif args.op == "thumbnail-brief":
+        print(yt_mod.thumbnail_brief(args.topic, args.style, args.text))
+
+
+def cmd_voice(args):
+    if args.op == "check":
+        res = voice_check_mod.check_text(args.text, args.platform)
+        print(f"voice score: {res['score']}/100 — "
+              f"{'sounds human' if res['human'] else 'sounds AI-ish'}")
+        for f in res["flags"]:
+            print(f"  flag [{f['type']}]: {f['match']!r} — {f['why']}")
+        for s in res["suggestions"]:
+            print(f"  fix: {s}")
+        if not res["human"]:
+            print(f"WARNING: score below threshold {voice_check_mod.WARN_THRESHOLD}",
+                  file=sys.stderr)
+    elif args.op == "guide":
+        p = os.path.join(REPO_ROOT, "voice", "guide.md")
+        with open(p, encoding="utf-8") as fh:
+            print(fh.read())
+
+
+def cmd_security(args):
+    if args.op == "audit":
+        for r in security_audit_mod.security_audit(home_dir()):
+            print(f"[{r['status'].upper():4s}] {r['check']}: {r['detail']}")
+    elif args.op == "checklist":
+        p = os.path.join(REPO_ROOT, "security", "checklist.md")
+        with open(p, encoding="utf-8") as fh:
+            print(fh.read())
+    elif args.op == "scan":
+        found, pat = secrets_mod.contains_secret(args.text)
+        if found:
+            print(f"REFUSED: secret-shaped content detected ({pat})")
+            sys.exit(2)
+        print("no secret-shaped content detected")
+
+
+def cmd_study(args):
+    if args.op == "run":
+        entry = study_mod.run_study(home_dir())
+        print(f"study entry written: {entry['events_analyzed']} events, "
+              f"{entry['actions_done']} actions done")
+        print("adjustments:")
+        for i, a in enumerate(entry["adjustments"], 1):
+            print(f"  {i}. {a}")
+        if args.propose:
+            props = study_mod.propose_updates(home_dir())
+            print("proposals (REVIEW ONLY, not applied):")
+            for p_ in props:
+                print(f"  - {p_}")
+    elif args.op == "experiment":
+        if args.eop == "start":
+            name = study_mod.start_experiment(home_dir(), args.name, args.kind,
+                                              args.a, args.b)
+            print(f"experiment {name!r} started: A={args.a!r} vs B={args.b!r}")
+        elif args.eop == "list":
+            for e in study_mod.list_experiments(home_dir()):
+                print(f"{e['name']} [{e['status']}] {e['kind']}: "
+                      f"A={e['variant_a']!r} vs B={e['variant_b']!r}"
+                      + (f" winner={e['winner']}" if e.get("winner") else ""))
+        elif args.eop == "conclude":
+            exp = study_mod.conclude_experiment(home_dir(), args.name,
+                                                args.metric_a, args.metric_b)
+            print(f"experiment {args.name!r} concluded: A={exp['metric_a']} "
+                  f"B={exp['metric_b']} winner={exp['winner']}")
+
+
+def _csv_list(s):
+    return [x.strip() for x in (s or "").split(",") if x.strip()]
+
+
+def cmd_identity(args):
+    if args.op == "create":
+        acct = resolve_account(args.account)
+        label = acct.get("label") or acct["username"]
+        meta = {"name": args.name,
+                "voice_traits": _csv_list(args.voice_traits),
+                "known_facts": _csv_list(args.facts),
+                "opinions": _csv_list(args.opinions),
+                "never_say": _csv_list(args.never_say)}
+        p = identity_mod.persona_path(home_dir(), label)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("---\n")
+            fh.write(f"name: {json.dumps(args.name)}\n")
+            for key, val in (("voice_traits", _csv_list(args.voice_traits)),
+                             ("known_facts", _csv_list(args.facts)),
+                             ("opinions", _csv_list(args.opinions)),
+                             ("never_say", _csv_list(args.never_say))):
+                fh.write(f"{key}:\n")
+                for item in val:
+                    fh.write(f"  - {json.dumps(item)}\n")
+            fh.write("---\n\n" + (args.notes or "Persona notes for "
+                                  f"{args.name}. Edit freely."))
+        print(f"persona created for {label} at {p}")
+    elif args.op == "show":
+        acct = resolve_account(args.account)
+        label = acct.get("label") or acct["username"]
+        meta, body = identity_mod.load_persona(home_dir(), label)
+        if meta is None:
+            print(f"no persona on file for {label!r}")
+            return
+        print(f"persona for {label} (owner: {meta.get('name', '?')})")
+        for k in ("voice_traits", "known_facts", "opinions", "never_say"):
+            vals = identity_mod._as_list(meta.get(k))
+            if vals:
+                print(f"  {k}: {', '.join(vals)}")
+        if body:
+            print(f"\n{body}")
+    elif args.op == "check":
+        acct = resolve_account(args.account)
+        label = acct.get("label") or acct["username"]
+        res = identity_mod.check_identity(args.text, label, home_dir())
+        if res["pass"]:
+            print(f"identity check PASSED for {label}")
+        else:
+            print(f"identity check FAILED for {label}", file=sys.stderr)
+            for r in res["reasons"]:
+                print(f"  - {r}", file=sys.stderr)
+            sys.exit(2)
+        for a in res["advisories"]:
+            print(f"note: {a}")
+    elif args.op == "add":
+        ident = identity_store.create_identity(home_dir(), args.name,
+                                               owner_name=args.owner or "")
+        print(f"identity '{ident['id']}' created (owner: {args.owner or '-'})")
+    elif args.op == "list":
+        idents = identity_store.list_identities(home_dir())
+        if not idents:
+            print("no identities yet — `identity add --name <name>`")
+            return
+        for i in idents:
+            full = identity_store.get_identity(home_dir(), i["id"])
+            accts = ", ".join(
+                f"{a['platform']}:{a['account_label']}"
+                for a in full["accounts"]) or "-"
+            print(f"{i['id']} (owner: {i['owner_name'] or '-'})"
+                  f" accounts=[{accts}]")
+    elif args.op == "link":
+        ident = identity_store.link_account(home_dir(), args.identity,
+                                            args.account, args.platform,
+                                            handle=args.handle or "")
+        print(f"linked {args.platform}:{args.account}"
+              f" -> identity '{args.identity}'")
+    elif args.op == "unlink":
+        identity_store.unlink_account(home_dir(), args.identity,
+                                      args.account)
+        print(f"unlinked {args.account} from '{args.identity}'")
+    elif args.op == "grant":
+        identity_store.grant(home_dir(), args.identity, args.action)
+        print(f"granted '{args.action}' to '{args.identity}'")
+    elif args.op == "revoke":
+        identity_store.revoke(home_dir(), args.identity, args.action)
+        print(f"revoked '{args.action}' from '{args.identity}'")
+    elif args.op == "check-perm":
+        ok = identity_store.may(home_dir(), args.identity, args.action)
+        appr = identity_store.approval_required(home_dir(), args.identity,
+                                                args.action)
+        print(f"identity '{args.identity}' may '{args.action}':"
+              f" {'YES' if ok else 'NO (fail-closed)'}")
+        print(f"human approval required: {'yes' if appr else 'no'}")
+        if not ok:
+            sys.exit(2)
+
+
+# -------------------------------------------------------------- moderate ---
+
+def _moderation_log():
+    return load_json("moderation.json", [])
+
+
+def cmd_moderate(args):
+    if args.op == "scan":
+        check_platform(args.platform)
+        resolve_account(args.account)
+        tos_mod.check_tos(args.platform, "automated_data_collection")
+        if not args.fixture:
+            raise UsageError("moderate scan needs --fixture (JSON list of comments)")
+        with open(args.fixture, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            data = data.get("items", [])
+        for it in data:
+            cls = mod_classify.classify_comment(str(it.get("text", "")))
+            print(f"{it.get('id')} [{cls['label']}] @{it.get('author')}: "
+                  f"{str(it.get('text', ''))[:90]}")
+            print(f"    score {cls['score']}: {'; '.join(cls['reasons'][:3])}")
+    elif args.op == "hide":
+        check_platform(args.platform)
+        acct = resolve_account(args.account)
+        try:
+            guard_acting(args.platform, "hide")
+        except RateLimited:
+            _queue_rate_limited("hide_other", args.platform, acct["username"],
+                                f"hide comment {args.comment}",
+                                {"target": args.comment, "text": args.text or ""})
+            raise
+        rec, auto = mod_propose.propose_hide(
+            home_dir(), get_policy(), args.platform, acct["username"],
+            args.post, args.comment, args.text or "", args.reason or "")
+        mid = rec["id"]
+        qtype = "hide_spam" if auto else "hide_other"
+        qitem = _queue_item_for(
+            qtype, args.platform, acct["username"],
+            f"hide comment {args.comment} ({rec['classification']})",
+            {"comment": args.comment, "post": args.post,
+             "text": (args.text or "")[:200]},
+            reason=args.reason or f"moderation: {rec['classification']}",
+            risk="high" if rec["classification"] in ("toxic", "spam") else "normal",
+            ref={"store": "moderation.json", "id": mid},
+            status="approved" if auto else "pending")
+        if auto:
+            rule = rec.get("auto_hide_rule", {})
+            print(f"hide {mid} AUTO-APPROVED under pre-approved rule "
+                  f"{rule.get('label')!r} ({rule.get('reason')}) "
+                  f"[queue {qitem['id']}]")
+        else:
+            print(f"DRY-RUN proposal {mid}: hide comment {args.comment} "
+                  f"[{args.platform}/{acct['username']}] ({rec['classification']})")
+            print(f"Queued for human approval as {qitem['id']}. "
+                  "Nothing was hidden. Run `moderate approve` to approve it explicitly.")
+        record_action(args.platform, "hide")
+    elif args.op == "list":
+        log = _moderation_log()
+        if args.status:
+            log = [m for m in log if m["status"] == args.status]
+        if not log:
+            print("no hide proposals")
+            return
+        for m in log:
+            print(f"{m['id']} [{m['status']}] hide {m['comment']} "
+                  f"({m['classification']}) [{m['platform']}/{m['account']}]")
+    elif args.op == "approve":
+        log = _moderation_log()
+        m = next((x for x in log if x["id"] == args.id), None)
+        if not m:
+            raise UsageError(f"unknown proposal {args.id!r}")
+        if m["status"] != "proposed":
+            raise UsageError(f"proposal {args.id} is {m['status']}, not proposed")
+        guard_acting(m["platform"], "hide")
+        qitem = approvals_queue.find_by_ref(home_dir(), "moderation.json", m["id"])
+        if qitem is None:
+            qitem = _queue_item_for(
+                "hide_other", m["platform"], m["account"],
+                f"hide comment {m['comment']} ({m['classification']})",
+                {"comment": m["comment"]},
+                reason="legacy hide proposal adopted into the unified queue",
+                ref={"store": "moderation.json", "id": m["id"]})
+        try:
+            backup_mod.recovery_point(
+                home_dir(), note=f"pre hide-approval recovery point {args.id}")
+            approvals_queue.approve(home_dir(), qitem["id"], apply_fn=_apply_approval,
+                                    decided_by="user")
+        except (KeyError, ValueError) as e:
+            raise UsageError(str(e))
+        print(f"hide {args.id} APPROVED for {m['platform']}/{m['account']}")
+        print("Hide the comment in a real browser session, then `moderate done`.")
+    elif args.op == "done":
+        log = _moderation_log()
+        m = next((x for x in log if x["id"] == args.id), None)
+        if not m:
+            raise UsageError(f"unknown proposal {args.id!r}")
+        if m["status"] != "approved":
+            raise UsageError(f"proposal {args.id} is {m['status']}; approve it first")
+        if not approval_valid(m):
+            m["status"] = "expired"
+            save_json("moderation.json", log)
+            raise Refused("approval expired; re-approve")
+        m["status"] = "done"
+        m["done_at"] = utcnow()
+        save_json("moderation.json", log)
+        print(f"hide {args.id} logged as done")
+
+
+# -------------------------------------------------------------- approvals ---
+
+def cmd_approvals(args):
+    if args.op == "list":
+        items = approvals_queue.list_items(home_dir(), status=args.status)
+        if not items:
+            print("approval queue is empty")
+            return
+        for i in items:
+            extra = f" retry_at={i['retry_at']}" if i.get("retry_at") else ""
+            print(f"{i['id']} [{i['status']}] {i['type']} "
+                  f"[{i['platform']}/{i['account']}] risk={i['risk']}: "
+                  f"{i['summary'][:80]}{extra}")
+    elif args.op == "policy":
+        per = (get_policy().get("approvals") or {}).get("per_type") or {}
+        print("per-type approval policy (unlisted types default to require):")
+        for t in sorted(set(list(per) + ["post", "post_video", "publish", "like",
+                                         "comment", "follow", "retweet", "reply",
+                                         "dm", "profile", "hide_spam", "hide_other"])):
+            print(f"  {t}: {approvals_queue.per_type_policy(get_policy(), t)}")
+    elif args.op in ("approve", "reject"):
+        try:
+            if args.op == "approve":
+                item = approvals_queue.approve(home_dir(), args.id,
+                                               apply_fn=_apply_approval,
+                                               decided_by="user")
+            else:
+                item = approvals_queue.reject(home_dir(), args.id,
+                                              args.reason or "",
+                                              apply_fn=_apply_rejection,
+                                              decided_by="user")
+        except (KeyError, ValueError) as e:
+            raise UsageError(str(e))
+        print(f"approval {item['id']} {item['status']}: {item['summary'][:80]}")
+        if args.op == "reject" and args.reason:
+            print(f"reason logged: {args.reason}")
+        if item["status"] == "approved":
+            print("Perform it in a real browser session; the CLI never acts by itself.")
+
+
+# ----------------------------------------------------------------- people ---
+
+def _people_account(args):
+    acct = resolve_account(args.account)
+    return acct["username"]
+
+
+def cmd_people(args):
+    username = _people_account(args)
+    if args.op == "top":
+        ranked = people_db.top(home_dir(), username, n=args.n)
+        if not ranked:
+            print("no people remembered for this account yet")
+            return
+        for handle, sc, rec in ranked:
+            tags = f" tags={','.join(rec.get('tags') or [])}" if rec.get("tags") else ""
+            print(f"@{handle} score={sc} "
+                  f"(comments={rec['counts'].get('comment',0)} "
+                  f"dms={rec['counts'].get('dm',0)} "
+                  f"follows={rec['counts'].get('follow',0)}){tags}")
+    elif args.op == "show":
+        rec = people_db.get(home_dir(), username, args.handle)
+        if not rec:
+            raise UsageError(f"no record for @{args.handle}")
+        print(json.dumps(rec, indent=2))
+    elif args.op == "note":
+        rec = people_db.add_note(home_dir(), username, args.handle, args.text)
+        print(f"note saved for @{args.handle} ({len(rec['notes'])} total)")
+    elif args.op == "tag":
+        rec = people_db.add_tag(home_dir(), username, args.handle, args.tag)
+        print(f"@{args.handle} tags: {', '.join(rec['tags'])}")
+    elif args.op == "untag":
+        rec = people_db.remove_tag(home_dir(), username, args.handle, args.tag)
+        print(f"@{args.handle} tags: {', '.join(rec['tags']) or '(none)'}")
+
+
+# -------------------------------------------------------------- ratelimit ---
+
+def cmd_ratelimit(args):
+    if args.op == "status":
+        rows = rl_controller.status(home_dir(), get_policy())
+        if not rows:
+            print("no buckets yet — no actions recorded")
+            return
+        for r in rows:
+            print(f"{r['bucket']}: {r['remaining_hour']}/{r['per_hour']} per hour, "
+                  f"{r['remaining_day']}/{r['per_day']} per day "
+                  f"(denials={r['denials']})")
+    elif args.op == "config":
+        for platform in ("tiktok", "x", "instagram", "facebook", "youtube", "reddit"):
+            for action in ("like", "comment", "follow", "hide", "post", "any"):
+                ph, pd = rl_controller.limits_for(get_policy(), platform, action)
+                print(f"{platform}/{action}: {ph}/hour, {pd}/day")
+
+
+# ----------------------------------------------------------------- crisis ---
+
+def _crisis_hold():
+    """Park pending/rate_limited acting items; return held ids."""
+    held = []
+    for item in approvals_queue.list_items(home_dir()):
+        if (item["status"] in ("pending", "rate_limited")
+                and item["type"] in crisis_mod.ACTING_TYPES):
+            approvals_queue.set_status(home_dir(), item["id"], "held")
+            held.append(item["id"])
+    return held
+
+
+def _crisis_release(held_ids):
+    released = []
+    for qid in held_ids:
+        try:
+            approvals_queue.set_status(home_dir(), qid, "pending")
+            released.append(qid)
+        except KeyError:
+            continue
+    return released
+
+
+def cmd_crisis(args):
+    if args.op == "status":
+        st = crisis_mod.get(home_dir())
+        print(f"crisis mode: {'ACTIVE' if st['active'] else 'off'}")
+        if st["active"]:
+            print(f"  reason: {st['reason'] or '(none given)'}")
+            print(f"  started: {st['started_at']}")
+            print(f"  held items: {len(st['held'])}")
+    elif args.op == "on":
+        if crisis_mod.is_active(home_dir()):
+            print("crisis mode is already ACTIVE")
+            return
+        st = crisis_mod.activate(home_dir(), args.reason or "",
+                                 hold_fn=_crisis_hold)
+        cfg = hb.load_config()
+        hb.ping_path(cfg.base_url, "crisis", "on", timeout=cfg.timeout)
+        hb.record_local("crisis", "crisis/on", True,
+                        args.reason or "crisis mode activated")
+        print(f"CRISIS MODE ON: all acting operations paused "
+              f"({len(st['held'])} queued item(s) held). Watchers keep monitoring.")
+        if args.reason:
+            print(f"reason: {args.reason}")
+        print("Alert pinged via heartbeat urgent channel + local audit log.")
+    elif args.op == "off":
+        if not crisis_mod.is_active(home_dir()):
+            print("crisis mode is already off")
+            return
+        backup_mod.recovery_point(
+            home_dir(), note="pre crisis-off recovery point")
+        st, released = crisis_mod.deactivate(home_dir(),
+                                             release_fn=_crisis_release)
+        cfg = hb.load_config()
+        hb.ping_path(cfg.base_url, "crisis", "off", timeout=cfg.timeout)
+        hb.record_local("crisis", "crisis/off", True, "crisis mode cleared")
+        print(f"crisis mode OFF ({len(released)} held item(s) re-pended for approval):")
+        for qid in released:
+            print(f"  {qid} -> pending (re-approve with `approvals approve {qid}`)")
+
+
+# ------------------------------------------------------------------ memory ---
+
+def cmd_memory(args):
+    home = home_dir()
+    op = args.op
+    if op == "query":
+        try:
+            cols, rows = mem_mod.query_select(home, args.sql)
+        except ValueError as e:
+            raise UsageError(str(e))
+        if not rows:
+            print("(no rows)")
+            return
+        print(" | ".join(cols))
+        for r in rows:
+            print(" | ".join(str(r.get(c, "")) for c in cols))
+        print(f"{len(rows)} row(s)")
+    elif op == "remember":
+        did = mem_mod.log_decision(home, args.by, args.summary, args.why or "")
+        print(f"decision {did} recorded")
+    elif op == "recall":
+        items = mem_mod.list_decisions(home)
+        if not items:
+            print("no decisions recorded")
+            return
+        for d in items:
+            print(f"{d['id']} [{d['made_by']}] {d['summary']}")
+            if d.get("rationale"):
+                print(f"    why: {d['rationale']}")
+    elif op == "relate":
+        rel = mem_mod.relate(home, args.subject, args.predicate, args.object,
+                             meta=json.loads(args.meta) if args.meta else None)
+        print(f"remembered: {rel['subject']} --{rel['predicate']}--> {rel['object']}")
+    elif op == "graph":
+        edges = mem_mod.graph(home, args.entity)
+        if not edges:
+            print(f"nothing known about {args.entity}")
+            return
+        for e in edges:
+            print(f"{e['subject']} --{e['predicate']}--> {e['object']}")
+    elif op == "campaign":
+        if args.cop == "add":
+            cid = mem_mod.create_campaign(home, args.name, args.account or "",
+                                          args.goal or "")
+            print(f"campaign {cid}: {args.name}")
+        elif args.cop == "list":
+            for c in mem_mod.list_campaigns(home):
+                print(f"{c['id']} [{c['status']}] {c['name']}"
+                      f" ({c['account_label'] or 'any account'})"
+                      + (f" — goal: {c['goal']}" if c.get("goal") else ""))
+    elif op == "schedule":
+        if args.sop == "add":
+            sid = mem_mod.schedule_add(home, args.account or "", args.type,
+                                       args.run_at,
+                                       payload=json.loads(args.payload)
+                                       if args.payload else None,
+                                       recurrence=args.recurrence or "")
+            print(f"scheduled {sid}: {args.type} at {args.run_at}")
+        elif args.sop == "list":
+            for s in mem_mod.schedule_list(home):
+                print(f"{s['id']} [{s['status']}] {s['action_type']}"
+                      f" [{s['account_label']}] run_at={s['run_at']}")
+        elif args.sop == "done":
+            mem_mod.schedule_set_status(home, args.id, "done")
+            print(f"schedule item {args.id} marked done")
+    elif op == "content":
+        if args.top == "add":
+            cid = mem_mod.content_add(home, args.account or "", args.kind,
+                                      args.title, file_path=args.file or "",
+                                      caption=args.caption or "",
+                                      campaign_id=args.campaign)
+            print(f"content {cid}: {args.title} [{args.kind}]")
+        elif args.top == "list":
+            for c in mem_mod.content_list(home, args.account or None):
+                print(f"{c['id']} [{c['status']}] {c['kind']}: {c['title']}"
+                      + (f" (campaign {c['campaign_id']})"
+                         if c.get("campaign_id") else ""))
+    elif op == "voice":
+        if args.vop == "set":
+            v = mem_mod.set_brand_voice(
+                home, args.account, tone_profile=args.tone or "",
+                banned=(args.banned or "").split(",") if args.banned else [],
+                dos=(args.dos or "").split(",") if args.dos else [],
+                donts=(args.donts or "").split(",") if args.donts else [])
+            print(f"brand voice saved for {args.account}")
+            print(f"  tone: {v['tone_profile']}")
+        elif args.vop == "show":
+            v = mem_mod.voice_profile(home, args.account)
+            print(f"tone: {v['tone_profile']}")
+            print(f"banned: {v['banned_terms']}")
+            print(f"dos: {v['dos']}")
+            print(f"donts: {v['donts']}")
+            if v["style_rules"]:
+                print("learned rules:")
+                for r in v["style_rules"]:
+                    print(f"  - {r['rule']}")
+            print(f"examples: {len(v['examples'])}"
+                  + (f" (last trained {v['last_trained']})"
+                     if v["last_trained"] else ""))
+        elif args.vop == "learn-example":
+            v = mem_mod.voice_learn_example(home, args.account, args.text,
+                                            kind=args.kind or "post")
+            print(f"learned example for {args.account}"
+                  f" ({len(v['examples'])} total)")
+        elif args.vop == "learn-rule":
+            v = mem_mod.voice_learn_rule(home, args.account, args.text)
+            print(f"learned rule for {args.account}"
+                  f" ({len(v['style_rules'])} total)")
+    elif op == "convo":
+        if args.cop == "log":
+            cid = mem_mod.convo_log(home, args.role, args.text,
+                                    account_label=args.account or "",
+                                    mission_id=args.mission,
+                                    kind=args.kind or "chat")
+            print(f"conversation {cid} logged [{args.role}]")
+        elif args.cop == "list":
+            items = mem_mod.convo_list(home, limit=args.limit or 50,
+                                       account_label=args.account or None,
+                                       mission_id=args.mission)
+            if not items:
+                print("no conversations recorded")
+                return
+            for c in items:
+                print(f"{c['id']} [{c['ts']}] {c['role']}:"
+                      f" {c['text'][:120]}")
+    elif op == "missions":
+        if args.mop == "create":
+            m = mem_mod.mission_create(home, args.name,
+                                       mission_type=args.type or "custom",
+                                       account_label=args.account or "",
+                                       spec=json.loads(args.spec)
+                                       if args.spec else None)
+            print(f"mission '{m['name']}' created [{m['status']}]")
+        elif args.mop == "list":
+            items = mem_mod.mission_list(home, status=args.status)
+            if not items:
+                print("no missions recorded")
+                return
+            for m in items:
+                print(f"{m['id']} [{m['status']}] {m['name']}"
+                      f" ({m['mission_type']})")
+        elif args.mop == "set-status":
+            m = mem_mod.mission_set_status(home, args.name, args.status)
+            if not m:
+                raise UsageError(f"unknown mission {args.name!r}")
+            print(f"mission '{args.name}' -> {args.status}")
+        elif args.mop == "pending":
+            items = mem_mod.mission_pending(home)
+            if not items:
+                print("no pending missions")
+                return
+            for m in items:
+                print(f"[{m['status']}] {m['name']} ({m['mission_type']})")
+        elif args.mop == "ledger":
+            items = mem_mod.ledger_list(home, limit=args.limit or 100,
+                                        status=args.status)
+            if not items:
+                print("no completed actions recorded")
+                return
+            for a in items:
+                print(f"{a['id']} [{a['status']}] {a['action_type']}"
+                      f" {a['target']} key={a['idem_key'][:12]}")
+    elif op == "analytics":
+        if args.aop == "log":
+            mem_mod.analytics_log(home, args.platform, args.metric,
+                                  args.value,
+                                  account_label=args.account or "",
+                                  period=args.period or "")
+            print(f"analytics: {args.platform}/{args.metric}={args.value}")
+        elif args.aop == "summary":
+            rows = mem_mod.analytics_summary(
+                home, platform=args.platform or None,
+                account_label=args.account or None)
+            if not rows:
+                print("no analytics recorded")
+                return
+            for r in rows:
+                print(f"{r['platform']}/{r['account_label'] or '-'}"
+                      f" {r['metric']}[{r['period'] or 'all'}]={r['value']}")
+    elif op == "account":
+        if args.aop == "add":
+            a = mem_mod.upsert_account(home, args.label, args.platform,
+                                       handle=args.handle or "",
+                                       brand=args.brand or "")
+            print(f"memory account: {a['label']} [{a['platform']}]"
+                  + (f" @{a['handle']}" if a.get("handle") else ""))
+        elif args.aop == "list":
+            for a in mem_mod.list_accounts(home):
+                print(f"{a['label']} [{a['platform']}]"
+                      + (f" @{a['handle']}" if a.get("handle") else "")
+                      + f" status={a['status']}")
+    elif op == "sop":
+        if args.sopop == "add":
+            sid, ver = mem_mod.sop_add(home, args.title, args.body or "")
+            print(f"SOP {sid} saved: {args.title} (v{ver})")
+        elif args.sopop == "list":
+            for s in mem_mod.sop_list(home):
+                print(f"{s['id']} v{s['version']} {s['title']}")
+        elif args.sopop == "show":
+            s = mem_mod.sop_get(home, args.id)
+            if not s:
+                raise UsageError(f"unknown SOP {args.id}")
+            print(f"# {s['title']} (v{s['version']})")
+            print(s["body_md"])
+
+
+# ------------------------------------------------------------------ backup ---
+
+def cmd_backup(args):
+    home = home_dir()
+    if args.op == "list":
+        if args.versioned:
+            snaps = backup_mod.list_versioned(home)
+            if not snaps:
+                print("no versioned snapshots yet")
+                return
+            latest = backup_mod.resolve_latest(home)
+            for m in snaps:
+                mark = "  <-- latest" if m["id"] == latest else ""
+                print(f"{m['id']} [{m['trigger']}] {m['timestamp']}"
+                      f" files={len(m.get('files', []))}{mark}"
+                      + (f" — {m['note']}" if m.get("note") else ""))
+            return
+        snaps = backup_mod.list_snapshots(home)
+        if not snaps:
+            print("no snapshots yet")
+            return
+        for m in snaps:
+            nfiles = len(m.get("files", []))
+            print(f"{m['id']} [{m['trigger']}] {m['timestamp']}"
+                  f" files={nfiles}"
+                  + (f" — {m['note']}" if m.get("note") else ""))
+    elif args.op == "snapshot":
+        if args.versioned:
+            m = backup_mod.versioned_snapshot(
+                home, trigger=args.trigger, note=args.note or "",
+                policy=get_policy())
+            print(f"versioned snapshot {m['id']} [{args.trigger}]"
+                  f" ({len(m['files'])} files, cache excluded)")
+            print("backups/latest now points at it")
+            return
+        files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
+        m = backup_mod.snapshot(home, args.trigger, files=files,
+                                note=args.note or "")
+        print(f"snapshot {m['id']} [{args.trigger}] ({len(m['files'])} files)")
+    elif args.op == "diff":
+        d = backup_mod.diff(home, args.id1, args.id2)
+        print(f"diff {d['from']} -> {d['to']}")
+        for p in d["added"]:
+            print(f"  + {p}")
+        for p in d["removed"]:
+            print(f"  - {p}")
+        for p in d["changed"]:
+            print(f"  ~ {p}")
+        for t in d["memory_tables_changed"]:
+            print(f"  ~ memory table: {t}")
+        if not (d["added"] or d["removed"] or d["changed"] or
+                d["memory_tables_changed"]):
+            print("  (no differences)")
+    elif args.op == "restore":
+        if args.versioned:
+            plan = backup_mod.versioned_restore(home, args.id,
+                                                dry_run=not args.apply)
+            for c in plan["changes"]:
+                print(f"  {c['action']}: {c['path']}")
+            if args.apply:
+                print(f"staged to {plan['staged_to']}")
+                print("Review the staging dir, then copy files into place"
+                      " yourself. Live files were NOT touched.")
+            else:
+                print("dry-run only. Re-run with --apply to stage.")
+            return
+        if args.apply:
+            plan = backup_mod.restore(home, args.id, dry_run=False)
+            print(f"staged to {plan['staged_to']}")
+            print("Review the staging dir, then copy files into place"
+                  " yourself. Live files were NOT touched.")
+        else:
+            plan = backup_mod.restore(home, args.id, dry_run=True)
+        for c in plan["changes"]:
+            print(f"  {c['action']}: {c['path']}")
+        if not args.apply:
+            print("dry-run only. Re-run with --apply to stage the restore.")
+    elif args.op == "export":
+        r = backup_mod.export_backup(home, args.id, args.dest)
+        print(f"exported {r['snapshot']} -> {r['bundle']} ({r['size']} bytes)")
+        print("Import on another machine with: backup import --bundle <file>")
+    elif args.op == "import":
+        r = backup_mod.import_backup(home, args.bundle, force=args.force)
+        print(f"imported snapshot {r['snapshot']}:"
+              f" {len(r['installed'])} files installed,"
+              f" {len(r['skipped'])} skipped")
+        for s in r["skipped"][:10]:
+            print(f"  skipped: {s}")
+    elif args.op == "remote-setup":
+        from core import install as _install
+        if args.provider not in _install.REMOTE_PROVIDERS:
+            raise UsageError(
+                f"unknown provider {args.provider!r} — choose from:"
+                f" {', '.join(_install.REMOTE_PROVIDERS)}")
+        info = _install.setup_remote_backup(home, args.provider,
+                                            args.target or "")
+        print(f"remote provider: {info.get('provider') or 'none (offline-only)'}")
+        if info.get("target"):
+            print(f"  target: {info['target']}")
+        print(f"  consent: {info.get('consent') or 'n/a'}")
+        print(f"  {info.get('encryption') or info.get('note', '')}")
+    elif args.op == "remote-status":
+        cfg = remote_mod.get_config(home)
+        if not cfg or not cfg.get("provider"):
+            print("remote backup: not configured (offline-only)."
+                  " `backup remote-setup --provider <name>` to enable.")
+            return
+        print(f"provider: {cfg['provider']}")
+        print(f"target: {cfg.get('target') or '-'}")
+        c = cfg.get("consent") or {}
+        print(f"consent: {'granted ' + c.get('granted_at', '') if c.get('granted_at') else 'MISSING'}")
+        e = cfg.get("encryption") or {}
+        print(f"encryption: {e.get('method') or 'NOT CONFIGURED'}")
+        ok, reasons = remote_mod.check_ready(home)
+        print(f"sync ready: {'yes' if ok else 'NO — ' + '; '.join(reasons)}")
+    elif args.op == "sync":
+        try:
+            r = remote_mod.sync(home,
+                                snapshot_name=args.snapshot or "latest")
+        except PermissionError as e:
+            print(f"REFUSED: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"synced {r['snapshot']} -> {r['provider']}"
+              f" ({r['size']} bytes, {r['method']})")
+        print(f"  {r.get('detail', '')}")
+
+
+# ----------------------------------------------------------------- recover ---
+
+def cmd_recover(args):
+    if args.full:
+        report = rec_mod.full_resume(home_dir(), execute=args.execute)
+        print(rec_mod.format_full_resume(report))
+        return
+    report = rec_mod.recover(home_dir(), execute=args.execute)
+    print(rec_mod.format_report(report))
+
+
+# --------------------------------------------------------------- scheduler ---
+
+def cmd_scheduler(args):
+    home = home_dir()
+    if args.op == "add":
+        job = sched_mod.add(home, args.name, args.kind, args.spec or "",
+                            json.loads(args.payload) if args.payload else None)
+        if not job:
+            raise UsageError(f"job {args.name!r} already exists")
+        print(f"scheduler job '{args.name}' [{args.kind}]"
+              f" next_run={job['next_run']}")
+    elif args.op == "list":
+        jobs = sched_mod.list_jobs(home, status=args.status)
+        if not jobs:
+            print("no scheduler jobs")
+            return
+        for j in jobs:
+            print(f"{j['name']} [{j['kind']}] status={j['status']}"
+                  f" next={j['next_run'] or '-'} runs={j['run_count']}")
+    elif args.op == "enable":
+        j = sched_mod.set_job(home, args.name, status="enabled")
+        if not j:
+            raise UsageError(f"unknown job {args.name!r}")
+        print(f"job '{args.name}' enabled")
+    elif args.op == "disable":
+        j = sched_mod.set_job(home, args.name, status="disabled")
+        if not j:
+            raise UsageError(f"unknown job {args.name!r}")
+        print(f"job '{args.name}' disabled")
+    elif args.op == "tick":
+        print(sched_mod.tick_summary(home))
+    elif args.op == "seed":
+        jobs = sched_mod.install_default_jobs(home)
+        print(f"seeded {len(jobs)} default job(s)")
+
+
+# --------------------------------------------------------------- workspace ---
+
+def cmd_workspace(args):
+    home = home_dir()
+    root = os.path.join(home, "workspaces")
+    if args.op == "init":
+        platform = (args.platform or "").strip().lower()
+        if not platform or not platform.replace("-", "").replace("_", "").isalnum():
+            raise UsageError("platform name must be alphanumeric")
+        wdir = os.path.join(root, platform)
+        os.makedirs(os.path.join(wdir, "state"), exist_ok=True)
+        cfg_path = os.path.join(wdir, "workspace.yaml")
+        if not os.path.exists(cfg_path):
+            with open(cfg_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    "# Workspace for %s. Shared core is NEVER duplicated"
+                    " here (see core/SHARED_CORE.md).\n"
+                    "platform: %s\nidentity: \"%s\"\naccounts: []\nnotes: \"\"\n"
+                    % (platform, platform, getattr(args, "identity", "") or ""))
+        print(f"workspace ready: {wdir}")
+        print("Shared core services (memory, execution tickets, backup,")
+        print("scheduler, watcher engine, resume engine, editor, audio,")
+        print("captions, analytics, approvals) are used from their single")
+        print("instances — never copied into the workspace.")
+    elif args.op == "list":
+        if not os.path.isdir(root):
+            print("no workspaces yet")
+            return
+        for name in sorted(os.listdir(root)):
+            wdir = os.path.join(root, name)
+            if os.path.isdir(wdir):
+                print(name)
+
+
+# ------------------------------------------------------------------- hands ---
+
+def cmd_hands(args):
+    """Execution tickets for the external agent browser.
+
+    social-agent never drives a browser itself. `hands ticket create`
+    runs the full guard order (ToS > crisis > approvals > rate limits >
+    quiet hours) and emits a machine-readable ticket; the agent's
+    browser fulfills it, and `hands ticket fulfill` closes the loop.
+    """
+    from hands import tickets as hands_mod
+    home = home_dir()
+    if args.op != "ticket":
+        raise UsageError("only `hands ticket` is supported")
+    tid = args.ticket_id or args.ticket or ""
+    if args.top == "create":
+        if args.platform not in SUPPORTED_PLATFORMS:
+            raise UsageError(f"unknown platform {args.platform!r}")
+        params = {}
+        if args.target:
+            params["target_url"] = args.target
+        if args.thread:
+            params["thread_url"] = args.thread
+        if args.text:
+            params["text"] = args.text
+        if args.file:
+            params["video_path"] = args.file
+            params["photo_path"] = args.file
+            params["file"] = args.file
+        if args.title:
+            params["title"] = args.title
+        try:
+            t = hands_mod.create_ticket(
+                home, args.platform, args.account, args.action,
+                params=params, policy=get_policy(),
+                approval_id=args.approval_id or None)
+        except hands_mod.TicketRefused as e:
+            raise Refused(str(e))
+        print(f"ticket {t['ticket_id']} [{t['platform']}/{t['account_label']}]"
+              f" {t['action']}: OPEN")
+        tos = (t.get("receipts") or {}).get("tos") or {}
+        if tos.get("acknowledged_risk"):
+            print("NOTE: issued under tos.acknowledged_risk"
+                  " (see the advisory above and audit/tos_acknowledgments.jsonl)")
+        print("The agent browser performs the instructions; close the loop"
+              f" with `hands ticket fulfill {t['ticket_id']} --result ...`.")
+    elif args.top == "list":
+        items = hands_mod.list_tickets(home, status=args.status or None)
+        if not items:
+            print("no execution tickets")
+            return
+        for t in items:
+            print(f"{t['ticket_id']} [{t['platform']}/{t['account_label']}]"
+                  f" {t['action']} status={t['status']}"
+                  f" created={t['created_at']}")
+    elif args.top == "show":
+        t = hands_mod.get_ticket(home, tid)
+        if t is None:
+            raise UsageError(f"unknown ticket {tid!r}")
+        import json as _json
+        print(_json.dumps(t, indent=2))
+    elif args.top == "fulfill":
+        try:
+            t = hands_mod.fulfill_ticket(home, tid,
+                                         result=args.result or "")
+        except hands_mod.TicketRefused as e:
+            raise Refused(str(e))
+        print(f"ticket {t['ticket_id']}: FULFILLED ({t['result']})")
+    elif args.top == "cancel":
+        try:
+            t = hands_mod.cancel_ticket(home, tid,
+                                        reason=args.reason or "")
+        except hands_mod.TicketRefused as e:
+            raise Refused(str(e))
+        print(f"ticket {t['ticket_id']}: CANCELLED")
+
+
+# ----------------------------------------------------------------- listen ---
+
+def cmd_listen(args):
+    if args.op == "once" or args.once:
+        report = listen_mod.run_once(home_dir(), get_policy(),
+                                     watcher_ids=args.watchers.split(",")
+                                     if args.watchers else None)
+    else:
+        interval = args.interval
+        print(f"listening every {interval}s over notification/comment/message "
+              f"watchers (Ctrl-C to stop; poll-based, see docs/listen-latency.md)")
+        try:
+            while True:
+                report = listen_mod.run_once(home_dir(), get_policy())
+                for wid, outs in report.items():
+                    for o in outs:
+                        print(f"[{wid}] {o}")
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("listener stopped")
+            return
+    total = 0
+    for wid, outs in report.items():
+        for o in outs:
+            print(f"[{wid}] {o}")
+            total += 1
+    print(f"listen pass complete: {len(report)} watcher(s), {total} outcome(s)")
+
+
+# --------------------------------------------------------------- caption ---
+
+def cmd_caption(args):
+    check_platform(args.platform)
+    label = ""
+    if args.account:
+        acct = resolve_account(args.account)
+        label = acct.get("label") or acct["username"]
+    extra = _csv_list(args.hashtags)
+    if args.op == "generate":
+        cap = captions_mod.generate(args.platform, args.topic, args.tone,
+                                    extra_hashtags=extra)
+        _warn(content_gates(args.platform, label, cap["caption"], "caption"))
+        print(cap["caption"])
+        print(f"\n[{cap['char_count']} chars | {len(cap['hashtags'])} hashtags | "
+              f"tone={cap['tone']}]")
+    elif args.op == "variants":
+        for i, cap in enumerate(captions_mod.variants(args.platform, args.topic,
+                                                      args.tone, n=args.n,
+                                                      extra_hashtags=extra), 1):
+            _warn(content_gates(args.platform, label, cap["caption"],
+                                f"caption_variant_{i}"))
+            print(f"--- variant {i} ---")
+            print(cap["caption"])
+            print()
+
+
+# ----------------------------------------------------------------- video ---
+
+def _require_ffmpeg():
+    path = vff.which_ffmpeg()
+    if not path:
+        raise UsageError("ffmpeg not found — see video/SETUP.md for install steps")
+    return path
+
+
+def cmd_video(args):
+    dry = bool(getattr(args, "dry_run", False))
+    if args.op == "info":
+        inf = vff.info(args.input)
+        print(f"duration : {inf.get('duration', 0):.2f}s")
+        print(f"size     : {inf.get('width')}x{inf.get('height')} "
+              f"@{inf.get('fps')}fps [{inf.get('vcodec')}]")
+        print(f"audio    : {inf.get('acodec', 'none')}")
+    elif args.op == "clip":
+        _require_ffmpeg()
+        vff.run_cmd(vff.build_clip(args.input, args.output, args.start,
+                                   args.duration, strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"clipped -> {args.output}")
+    elif args.op == "trim":
+        _require_ffmpeg()
+        vff.run_cmd(vff.build_trim(args.input, args.output, args.start, args.end,
+                        strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"trimmed -> {args.output}")
+    elif args.op == "concat":
+        _require_ffmpeg()
+        inputs = [p.strip() for p in (args.inputs or "").split(",") if p.strip()]
+        vff.run_cmd(vff.build_concat(inputs, args.output, strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"concatenated {len(inputs)} files -> {args.output}")
+    elif args.op == "to-vertical":
+        _require_ffmpeg()
+        inf = vff.info(args.input)
+        fplan = vfit.plan(inf, "tiktok:feed")
+        print(fplan["reason"])
+        if fplan["strategy"] == "noop":
+            if not dry:
+                import shutil as _shutil
+                _shutil.copy2(args.input, args.output)
+                print(f"already 9:16 — copied -> {args.output}")
+            else:
+                print("dry-run: would copy input (already 9:16)")
+        else:
+            vff.run_cmd(vfit.build_fit(args.input, args.output, fplan,
+                                       strict=not dry), dry_run=dry)
+            if not dry:
+                print(f"vertical 9:16 -> {args.output}")
+    elif args.op == "to-horizontal":
+        _require_ffmpeg()
+        inf = vff.info(args.input)
+        fplan = vfit.plan(inf, "youtube:long-form")
+        print(fplan["reason"])
+        if fplan["strategy"] == "noop":
+            if not dry:
+                import shutil as _shutil
+                _shutil.copy2(args.input, args.output)
+                print(f"already 16:9 — copied -> {args.output}")
+            else:
+                print("dry-run: would copy input (already 16:9)")
+        else:
+            vff.run_cmd(vfit.build_fit(args.input, args.output, fplan,
+                                       strict=not dry), dry_run=dry)
+            if not dry:
+                print(f"horizontal 16:9 -> {args.output}")
+    elif args.op == "fit":
+        _require_ffmpeg()
+        target = getattr(args, "for_", None) or "tiktok"
+        inf = vff.info(args.input)
+        try:
+            fplan = vfit.plan(inf, target, crop=args.crop, focus=args.focus,
+                              focus_x=args.focus_x, focus_y=args.focus_y)
+        except ValueError as e:
+            print(f"REFUSED: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(f"strategy : {fplan['strategy']}")
+        print(f"target   : {fplan['platform']}:{fplan['placement']} "
+              f"({fplan['spec']['aspect']})")
+        print(f"reason   : {fplan['reason']}")
+        if fplan.get("crop"):
+            box = fplan["crop"]["box"]
+            print(f"crop box : scaled {box['scaled'][0]}x{box['scaled'][1]}, "
+                  f"offset {box['offset']}, size {box['size'][0]}x{box['size'][1]}")
+            print(f"cut      : {fplan['crop']['summary']}")
+        for w in fplan.get("warnings", []):
+            print(f"warning  : {w}")
+        if fplan["strategy"] == "noop":
+            print("no conversion needed — nothing to do")
+        else:
+            vff.run_cmd(vfit.build_fit(args.input, args.output, fplan,
+                                       strict=not dry), dry_run=dry)
+            if not dry:
+                print(f"fitted -> {args.output}")
+    elif args.op == "preflight":
+        video_preflight_gate(args.input, getattr(args, "for_", None) or "tiktok")
+    elif args.op == "frame":
+        _require_ffmpeg()
+        vff.run_cmd(vff.build_frame(args.input, args.output, at=args.at,
+                        strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"frame @ {args.at}s -> {args.output}")
+    elif args.op == "compress":
+        _require_ffmpeg()
+        vff.run_cmd(vff.build_compress(args.input, args.output, args.preset,
+                        strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"compressed [{args.preset}] -> {args.output}")
+    elif args.op == "export":
+        _require_ffmpeg()
+        argv, meta = vff.build_export(args.input, args.output,
+                                      resolution=args.resolution,
+                                      codec=args.codec,
+                                      vertical=args.vertical, strict=not dry)
+        print(f"encoder: {meta['encoder']} ({meta['kind']})")
+        vff.run_cmd(argv, dry_run=dry)
+        if not dry:
+            print(f"exported [{meta['resolution']}/{meta['codec']}] -> {args.output}")
+            _backup_trigger("video_rendered", files=[args.output],
+                            note=f"video export -> {args.output}")
+    elif args.op == "plan":
+        if args.pop == "create":
+            steps = json.loads(args.steps)
+            plan = vplans.create(home_dir(), args.name, steps,
+                                 description=args.description or "")
+            print(f"plan {args.name!r} created with {len(plan['steps'])} step(s)")
+        elif args.pop == "list":
+            names = vplans.list_plans(home_dir())
+            print("no plans" if not names else "\n".join(names))
+        elif args.pop == "show":
+            plan = vplans.load(home_dir(), args.name)
+            print(json.dumps(plan, indent=2))
+        elif args.pop == "run":
+            _require_ffmpeg()
+            vplans.run(home_dir(), args.name, args.input, args.output,
+                       dry_run=dry)
+            if not dry:
+                print(f"plan {args.name!r} executed -> {args.output}")
+
+
+# ----------------------------------------------------------------- audio ---
+
+def cmd_audio(args):
+    dry = bool(getattr(args, "dry_run", False))
+    if args.op == "clip":
+        _require_ffmpeg()
+        audio_mod.run_cmd(audio_mod.build_clip(args.input, args.output, args.start,
+                                               args.duration, args.fade_in,
+                                               args.fade_out, strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"audio clipped -> {args.output}")
+    elif args.op == "loop":
+        _require_ffmpeg()
+        audio_mod.run_cmd(audio_mod.build_loop(args.input, args.output,
+                                               args.duration, strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"audio looped to {args.duration}s -> {args.output}")
+    elif args.op == "mix":
+        _require_ffmpeg()
+        audio_mod.run_cmd(audio_mod.build_mix(args.voiceover, args.bed,
+                                              args.output, args.duck_db,
+                                              strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"mixed (bed ducked {args.duck_db}dB) -> {args.output}")
+    elif args.op == "extract":
+        _require_ffmpeg()
+        audio_mod.run_cmd(audio_mod.build_extract(args.video, args.output,
+                                              strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"audio extracted -> {args.output}")
+    elif args.op == "normalize":
+        _require_ffmpeg()
+        audio_mod.run_cmd(audio_mod.build_normalize(args.input, args.output,
+                                                    args.preset, strict=not dry), dry_run=dry)
+        if not dry:
+            print(f"normalized [{args.preset}] -> {args.output}")
+
+
+# ---------------------------------------------------------------- editor ---
+
+def _ed_dry(args):
+    return bool(getattr(args, "dry_run", False))
+
+
+def cmd_editor(args):
+    dry = _ed_dry(args)
+    op = args.eop
+    if op == "watch":
+        _require_ffmpeg()
+        a = ed_analyze.watch(args.input, out_dir=args.out)
+        print(f"duration : {a['duration']}s  {a['width']}x{a['height']}@{a['fps']}")
+        print(f"scenes   : {a['scene_count']} cuts")
+        print(f"speech   : {a['speech_ratio']*100:.0f}% of audio")
+        print(f"analysis -> {os.path.join(args.out, 'analysis.json')}")
+    elif op == "highlights":
+        a = ed_analyze.load(args.dir)
+        hl = ed_hl.find_highlights(a, top_n=args.top)
+        ed_hl.save_highlights(hl, os.path.join(args.dir, "highlights.json"))
+        for i, h in enumerate(hl, 1):
+            print(f"{i}. {h['start']}s->{h['end']}s score={h['score']} ({h['reason']})")
+        if args.make:
+            _require_ffmpeg()
+            outs = ed_hl.make_clips(a["input"], hl,
+                                    os.path.join(args.dir, "clips"), dry_run=dry)
+            print(f"{len(outs)} clip(s) -> {os.path.join(args.dir, 'clips')}")
+    elif op == "grade":
+        if args.gop == "list":
+            for name, desc in ed_grading.list_grades().items():
+                print(f"{name:12s} {desc}")
+        else:
+            _require_ffmpeg()
+            filt = ed_grading.filtergraph(args.look)
+            print(f"look: {args.look} — {ed_grading.describe(args.look)}")
+            argv = [vff.FFMPEG, "-y", "-i", args.input, "-vf", filt,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "19",
+                    "-c:a", "aac", args.output]
+            vff._guard(args.input, args.output, not dry)
+            vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"graded [{args.look}] -> {args.output}")
+    elif op == "transcribe":
+        _require_ffmpeg()
+        if ed_subs.whisper_available():
+            print("whisper is installed — run it directly for best results, e.g.:")
+            print(f"  whisper {args.input} --model base --output_dir {args.dir}")
+        a = ed_analyze.load(args.dir) if os.path.isdir(args.dir) else None
+        silence = (a or {}).get("silence_spans", [])
+        dur = (a or {}).get("duration") or vff.info(args.input)["duration"]
+        out = os.path.join(args.dir, "captions.srt")
+        os.makedirs(args.dir, exist_ok=True)
+        ed_subs.heuristic_srt(args.transcript, dur, silence, out)
+        cues = ed_subs.parse_srt(out)
+        print(f"heuristic SRT: {len(cues)} cues -> {out}")
+        print("note: timing heuristic (even word distribution over speech); "
+              "install whisper for real transcription")
+    elif op == "captions":
+        _require_ffmpeg()
+        argv = ed_subs.build_burn_in(args.input, args.output, args.srt,
+                                     args.style, strict=not dry)
+        vff.run_cmd(argv, dry_run=dry)
+        if not dry:
+            print(f"captions [{args.style}] burned -> {args.output}")
+    elif op == "broll-plan":
+        a = ed_analyze.load(args.dir)
+        files = [p.strip() for p in (args.broll or "").split(",") if p.strip()]
+        plan = ed_broll.plan(a, files, mode=args.mode,
+                             position=args.position)
+        ed_broll.save_plan(plan, args.out)
+        print(f"{len(plan['items'])} insert(s) planned -> {args.out}")
+        for it in plan["items"]:
+            print(f"  {it['at']}s +{it['duration']}s [{it['mode']}] {it['file']}")
+    elif op == "broll-apply":
+        _require_ffmpeg()
+        with open(args.plan, encoding="utf-8") as fh:
+            plan = json.load(fh)
+        if args.mode == "pip":
+            argv = ed_broll.build_apply_pip(args.input, args.output, plan,
+                                            strict=not dry)
+            vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"b-roll applied -> {args.output}")
+        else:
+            seq = ed_broll.build_apply_cutaway(args.input, args.output, plan)
+            print(json.dumps(seq, indent=2))
+            print("cutaway plan above — cut segments with `video clip`, then concat")
+    elif op == "project":
+        if args.editor_kind == "kdenlive":
+            proj = ed_kdenlive.Project(title=args.title, profile=args.profile)
+        else:
+            proj = ed_shotcut.Project(title=args.title)
+        spec = json.loads(args.spec)
+        amap = {}
+        for path in spec.get("assets", []):
+            amap[path] = proj.add_asset(path)
+        for c in spec.get("clips", []):
+            aid = amap.get(c["asset"]) or proj.add_asset(c["asset"])
+            amap[c["asset"]] = aid
+            cid = proj.add_clip(aid, track=c.get("track", "v1"),
+                                in_s=c.get("in", 0), out_s=c.get("out"))
+            for fx in c.get("effects", []):
+                if hasattr(proj, "add_effect"):
+                    proj.add_effect(cid, fx if isinstance(fx, str) else fx["name"],
+                                    fx.get("params") if isinstance(fx, dict) else None)
+        for m in spec.get("markers", []):
+            if hasattr(proj, "add_marker"):
+                proj.add_marker(m.get("time", 0), m.get("comment", ""))
+        missing = proj.missing_media()
+        if missing:
+            print(f"warning: {len(missing)} missing media file(s):")
+            for m_ in missing[:5]:
+                print(f"  ! {m_}")
+        proj.save(args.out)
+        print(f"{args.editor_kind} project -> {args.out} "
+              f"({len(proj.assets)} assets, {len(proj.timeline)} clips)")
+        if not ed_kdenlive.Project.kdenlive_available() and args.editor_kind == "kdenlive":
+            print("note: kdenlive GUI not installed here — open the .kdenlive "
+                  "file in Kdenlive (see editor/KDENLIVE.md)")
+    elif op == "brand":
+        if args.bop == "create":
+            p = ed_brand.create(home_dir(), args.label)
+            print(f"brand kit -> {p} (edit colors/logo/grade to taste)")
+        elif args.bop == "list":
+            kits = ed_brand.list_kits(home_dir())
+            print("no kits" if not kits else "\n".join(kits))
+        elif args.bop == "show":
+            print(ed_brand._dump_yaml(ed_brand.load(home_dir(), args.label)))
+        elif args.bop == "apply":
+            _require_ffmpeg()
+            kit = ed_brand.load(home_dir(), args.label)
+            argv = ed_brand.build_apply(args.input, args.output, kit,
+                                        strict=not dry)
+            vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"brand [{args.label}] applied -> {args.output}")
+    elif op == "batch":
+        _require_ffmpeg()
+        kw = {}
+        if args.op_ == "grade":
+            kw["look"] = args.look
+        elif args.op_ == "compress":
+            kw["preset"] = args.preset
+        elif args.op_ == "captions":
+            kw.update(srt=args.srt, style=args.style)
+        elif args.op_ == "brand":
+            kw["kit"] = ed_brand.load(home_dir(), args.kit)
+        res = ed_batch.run_batch(home_dir(), args.op_,
+                                 [args.in_], args.out, dry_run=dry, **kw)
+        print(f"ok: {len(res['ok'])}, failed: {len(res['failed'])}")
+        for f in res["failed"]:
+            print(f"  FAIL {f['src']}: {f['error']}")
+    elif op == "queue":
+        if args.qop == "add":
+            r = ed_batch.queue_add(home_dir(), args.name, args.cmd.split(),
+                                   at=args.at)
+            print(f"queued {r['job']}" + (f" @ {r['at']}" if r["at"] else ""))
+            if r.get("note"):
+                print("note:", r["note"])
+        elif args.qop == "list":
+            jobs = ed_batch.queue_list(home_dir())
+            if not jobs:
+                print("queue empty")
+            for j in jobs:
+                print(f"{j['name']:20s} {j['state']:12s} attempts={j['attempts']}")
+        elif args.qop == "run":
+            done_count = 0
+            for r in ed_batch.queue_run(home_dir(), name=args.name,
+                                        resume=args.resume, dry_run=dry):
+                print(f"{r['job']}: {r['state']}"
+                      + (f" ({r['error']})" if r.get("error") else "")
+                      + (f" — {r['note']}" if r.get("note") else ""))
+                if r.get("state") == "done":
+                    done_count += 1
+            if done_count and not dry:
+                _backup_trigger("video_rendered", files=["render_queue.json"],
+                                note=f"render queue finished {done_count} job(s)")
+    elif op == "qa":
+        _require_ffmpeg()
+        res = ed_qa.verify(args.input, srt_path=args.srt)
+        print("PASS" if res["passed"] else "FAIL")
+        for i in res["issues"]:
+            print(f"  ! {i}")
+        if not res["passed"]:
+            sys.exit(2)
+    elif op == "thumb":
+        _require_ffmpeg()
+        brand = ed_brand.load(home_dir(), args.brand) if args.brand else None
+        res = ed_thumb.make(args.input, args.output, at=args.at,
+                            text=args.text or "", brand=brand, dry_run=dry)
+        print(f"thumbnail -> {res['path']}")
+        if res.get("contrast"):
+            print(f"text contrast ratio: {res['contrast']['ratio']} "
+                  f"({'ok' if res['contrast']['ok'] else 'low — scrim applied'})")
+    elif op == "camera":
+        _require_ffmpeg()
+        if args.cop == "stabilize":
+            passes = ed_camera.build_stabilize(args.input, args.output,
+                                               strict=not dry)
+            for p_ in passes:
+                argv = p_["argv"] if isinstance(p_, dict) else p_
+                if isinstance(p_, dict):
+                    print("note:", p_["fallback"])
+                vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"stabilized -> {args.output}")
+        else:
+            argv = ed_camera.build_enhance(
+                args.input, args.output, denoise=args.denoise,
+                temp=args.temp, brightness=args.brightness,
+                contrast=args.contrast, deflicker=args.deflicker,
+                strict=not dry)
+            vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"enhanced -> {args.output}")
+    elif op == "compress":
+        _require_ffmpeg()
+        if args.xop == "crf":
+            argv = ed_compress.build_crf(args.input, args.output,
+                                         codec=args.codec, quality=args.quality,
+                                         strict=not dry)
+            vff.run_cmd(argv, dry_run=dry)
+            if not dry:
+                print(f"compressed [{args.codec}/{args.quality}] -> {args.output}")
+        else:
+            passes = ed_compress.build_twopass(args.input, args.output,
+                                               args.target_mb, codec=args.codec,
+                                               strict=not dry)
+            for p_ in passes:
+                vff.run_cmd(p_, dry_run=dry)
+            if not dry:
+                print(f"2-pass -> {args.output} (~{args.target_mb}MB target)")
+    elif op == "export":
+        _require_ffmpeg()
+        argv, meta = vff.build_export(args.input, args.output,
+                                      resolution=args.resolution,
+                                      codec=args.codec,
+                                      vertical=args.vertical, strict=not dry)
+        print(f"encoder: {meta['encoder']} ({meta['kind']})")
+        vff.run_cmd(argv, dry_run=dry)
+        if not dry:
+            print(f"exported [{meta['resolution']}/{meta['codec']}] -> {args.output}")
+            _backup_trigger("video_rendered", files=[args.output],
+                            note=f"editor export -> {args.output}")
+    elif op == "motion":
+        if args.mop == "lower-third":
+            p_ = ed_motion.lower_third(args.text, subtext=args.subtext or "",
+                                       output=args.output)
+            print(f"lower third -> {p_}")
+        elif args.mop == "card":
+            p_ = ed_motion.text_card(args.text, output=args.output)
+            print(f"title card -> {p_}")
+        elif args.mop == "intro-outro":
+            kit = ed_brand.load(home_dir(), args.brand)
+            outs = ed_motion.intro_outro(
+                {"name": kit.get("name", ""), "colors":
+                 {k: tuple(v) for k, v in kit.get("colors", {}).items()},
+                 "intro_text": kit.get("intro_text", ""),
+                 "outro_text": kit.get("outro_text", "")},
+                args.out)
+            for name, o in outs.items():
+                print(f"{name}: card -> {o['png']}")
+                print(f"  render with: {' '.join(o['argv'][:6])} ... "
+                      f"(full cmd via --dry-run on export)")
+    else:
+        raise UsageError(f"unknown editor op {op!r}")
+
+
+def cmd_doctor(args):
+    checks = []
+
+    def _ed_pil():
+        try:
+            import PIL  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def check(name, ok, detail=""):
+        checks.append((name, ok, detail))
+
+    check("python >= 3.8", sys.version_info >= (3, 8), sys.version.split()[0])
+    try:
+        os.makedirs(home_dir(), exist_ok=True)
+        probe = os.path.join(home_dir(), ".writetest")
+        with open(probe, "w") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        check("state dir writable", True, home_dir())
+    except OSError as e:
+        check("state dir writable", False, str(e))
+    try:
+        pol = get_policy()
+        check("policy.yaml parses", True, f"version {pol.get('version')}")
+    except Exception as e:
+        check("policy.yaml parses", False, str(e))
+    for p in SUPPORTED_PLATFORMS:
+        try:
+            get_adapter(p)
+            check(f"platform adapter: {p}", True)
+        except Exception as e:
+            check(f"platform adapter: {p}", False, str(e))
+    try:
+        n = 0
+        for p in SUPPORTED_PLATFORMS:
+            tos_mod.load_rules(p)
+            n += 1
+        check("ToS rules parse", True, f"{n} platforms")
+    except Exception as e:
+        check("ToS rules parse", False, str(e))
+    check("watcher types", True, ", ".join(sorted(REGISTRY)))
+    fx = FIXTURES_DIR
+    nfx = len([f for f in os.listdir(fx) if f.endswith(".json")]) if os.path.isdir(fx) else 0
+    check("sample fixtures", nfx > 0, f"{nfx} fixture files")
+    check("credentials stored in repo", False, "good: none (by design)")
+    try:
+        mem_mod.init_db(home_dir())
+        ver = mem_mod.schema_version(home_dir())
+        check("permanent memory (memory.db)", ver >= mem_mod.SCHEMA_VERSION,
+              f"schema v{ver} at {mem_mod.db_path(home_dir())}")
+    except Exception as e:
+        check("permanent memory (memory.db)", False, str(e))
+    try:
+        unf = rec_mod.unfinished(home_dir())
+        stale = rec_mod.stale_runner(home_dir())
+        detail = f"{len(unf)} unfinished journal entr" + \
+            ("ies" if len(unf) != 1 else "y")
+        if stale:
+            detail += f"; UNCLEAN SHUTDOWN ({stale['reason']}) — run `recover`"
+        # informational: never fails doctor
+        check("action journal", True, detail)
+    except Exception as e:
+        check("action journal", False, str(e))
+    snaps = backup_mod.list_snapshots(home_dir())
+    check("backup snapshots", True,
+          f"{len(snaps)} snapshot(s)"
+          + (f", latest {snaps[0]['id']}" if snaps else ""))
+    check("crash recovery module", True, "recover --help")
+    try:
+        import missions as _m  # noqa: F401
+        check("missions module", True, _m.missions_dir())
+    except Exception as e:
+        check("missions module", False, str(e))
+    try:
+        from heartbeat import pinger as _hb
+        hcfg = _hb.load_config()
+        check("heartbeat config", True,
+              f"enabled={hcfg.enabled} base_url={'set' if hcfg.base_url else 'log-only'}")
+    except Exception as e:
+        check("heartbeat config", False, str(e))
+    ff = vff.which_ffmpeg()
+    check("ffmpeg (video/audio editing)", bool(ff), ff or "not found — see video/SETUP.md")
+    check("ffprobe (video info)", bool(vff.ffprobe()),
+          vff.ffprobe() or "not found — see video/SETUP.md")
+    for modname, desc in (("moderation.classify", "comment moderation"),
+                          ("captions.generate", "caption generator"),
+                          ("video.ffmpeg", "video command builders"),
+                          ("video.plans", "video edit plans"),
+                          ("video.fit", "smart aspect-ratio fitter"),
+                          ("audio.clips", "audio clipping/mixing"),
+                          ("editor.grading", "cinematic grades"),
+                          ("editor.kdenlive", "Kdenlive project model"),
+                          ("editor.shotcut", "Shotcut project model"),
+                          ("editor.subtitles", "subtitles/captions"),
+                          ("editor.highlights", "highlight detection"),
+                          ("editor.broll", "b-roll planner"),
+                          ("editor.motion", "motion graphics"),
+                          ("editor.branding", "brand kits"),
+                          ("editor.batch", "batch + render queue"),
+                          ("editor.qa", "quality assurance"),
+                          ("editor.thumbnails", "thumbnails"),
+                          ("editor.camera", "camera enhancements"),
+                          ("editor.compress", "compression ladders")):
+        try:
+            __import__(modname)
+            check(f"module: {desc}", True)
+        except Exception as e:
+            check(f"module: {desc}", False, str(e))
+    import shutil as _shutil
+    check("PIL (motion graphics/thumbnails)", _ed_pil(), "available" if _ed_pil() else "pip install pillow")
+    # optional tooling: informational only, never fail the doctor
+    check("melt (headless render, optional)", True,
+          _shutil.which("melt") or "not installed — GUI render instead (see editor/KDENLIVE.md)")
+    check("kdenlive GUI (optional)", True,
+          _shutil.which("kdenlive") or "not installed — projects still authored as XML")
+    check("whisper transcription (optional)", True,
+          "installed" if _shutil.which("whisper") else "not installed — transcript+heuristic fallback")
+
+    failed = 0
+    for name, ok, detail in checks:
+        # the credentials check is inverted: ok=False is the desired state
+        good = ok if name != "credentials stored in repo" else not ok
+        mark = "ok  " if good else "FAIL"
+        if not good:
+            failed += 1
+        print(f"[{mark}] {name}" + (f" — {detail}" if detail else ""))
+    if failed:
+        raise UsageError(f"{failed} check(s) failed")
+    print("doctor: all checks passed")
+
+
+# ------------------------------------------------------------------- main ---
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="social-agent",
+        description="Autonomous social-media monitoring toolkit. "
+                    "Watchers observe and propose; acting needs explicit approval.")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("accounts", help="list/configure accounts (no credentials stored)")
+    a_sub = a.add_subparsers(dest="op", required=True)
+    a_sub.add_parser("list", help="list configured accounts")
+    p = a_sub.add_parser("add", help="add an account")
+    p.add_argument("--platform", required=True, help=",".join(SUPPORTED_PLATFORMS))
+    p.add_argument("--username", required=True)
+    p.add_argument("--label", default="")
+    p = a_sub.add_parser("remove", help="remove an account")
+    p.add_argument("ref")
+    p = a_sub.add_parser("show", help="show account + platform auth notes")
+    p.add_argument("ref")
+    a.set_defaults(func=cmd_accounts)
+
+    w = sub.add_parser("watch", help="manage poll-based watchers")
+    w_sub = w.add_subparsers(dest="op", required=True)
+    p = w_sub.add_parser("start", help="start a watcher")
+    p.add_argument("--type", required=True, help=",".join(sorted(REGISTRY)))
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--set", action="append", default=[], help="config key=value (repeatable)")
+    p.add_argument("--fixture", default=None, help="JSON fixture file for offline polling")
+    p.add_argument("--id", default=None, help="watcher id (generated if omitted)")
+    w_sub.add_parser("list", help="list watchers")
+    p = w_sub.add_parser("stop", help="stop a watcher")
+    p.add_argument("id")
+    p = w_sub.add_parser("status", help="watcher status")
+    p.add_argument("id", nargs="?")
+    p = w_sub.add_parser("run", help="run one poll tick now")
+    p.add_argument("id")
+    p = w_sub.add_parser("register-platform",
+                         help="register every watcher a platform declares"
+                              " with the shared Watcher Engine")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", default="")
+    p.add_argument("--fixtures-dir", default=None,
+                   help="offline fixture dir (default: engine fixtures)")
+    p = w_sub.add_parser("events", help="show recorded events")
+    p.add_argument("--watcher", default=None)
+    p.add_argument("--limit", type=int, default=20)
+    w.set_defaults(func=cmd_watch)
+
+    p_ = sub.add_parser("post", help="draft/queue/approve posts (approval-gated)")
+    p_sub = p_.add_subparsers(dest="op", required=True)
+    p = p_sub.add_parser("draft", help="draft a post")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--text", required=True)
+    p.add_argument("--media", default="")
+    p.add_argument("--video", default="", help="video file: spec-preflighted before drafting")
+    p.add_argument("--id", default=None)
+    p = p_sub.add_parser("queue", help="move draft to queued")
+    p.add_argument("id")
+    p = p_sub.add_parser("approve", help="approve a post (rate-limited, quiet-hours aware)")
+    p.add_argument("id")
+    p = p_sub.add_parser("list", help="list posts")
+    p.add_argument("--status", default=None)
+    p_.set_defaults(func=cmd_post)
+
+    e = sub.add_parser("engage", help="propose/approve/log engagement (dry-run default)")
+    e_sub = e.add_subparsers(dest="op", required=True)
+    for act in ENGAGE_ACTIONS:
+        p = e_sub.add_parser(act, help=f"propose a {act} (dry-run, creates proposal)")
+        p.add_argument("--platform", required=True)
+        p.add_argument("--account", required=True)
+        p.add_argument("--target", required=True, help="post/user/message id or URL")
+        p.add_argument("--text", default="", help="comment text (required for comment); "
+                                                 "for like: the post's text (for interest scoring)")
+        p.add_argument("--author", default="", help="post author's handle (like: cooldown + scoring)")
+        p.add_argument("--hashtags", default="", help="comma-separated post hashtags (like: scoring)")
+        p.add_argument("--likes-count", type=int, default=None, help="post like count (scoring)")
+        p.add_argument("--comments-count", type=int, default=None, help="post comment count (scoring)")
+    p = e_sub.add_parser("approve", help="approve a proposed action")
+    p.add_argument("id")
+    p = e_sub.add_parser("done", help="log an approved action as performed")
+    p.add_argument("id")
+    p.add_argument("--result", default="")
+    p = e_sub.add_parser("list", help="list engagement actions")
+    p.add_argument("--status", default=None)
+    e.set_defaults(func=cmd_engage)
+
+    m = sub.add_parser("mission", help="define an area of work for autonomous mode")
+    m_sub = m.add_subparsers(dest="op", required=True)
+    p = m_sub.add_parser("create", help="create a mission file")
+    p.add_argument("--name", required=True)
+    p.add_argument("--platforms", required=True, help="comma-separated")
+    p.add_argument("--topics", default="", help="comma-separated content pillars")
+    p.add_argument("--actions", required=True, help="comma-separated allowed actions")
+    p.add_argument("--limit", action="append", default=[], help="limit key=value (repeatable)")
+    p.add_argument("--brief", default="", help="free-text mission brief")
+    m_sub.add_parser("list", help="list missions")
+    p = m_sub.add_parser("show", help="show a mission")
+    p.add_argument("name")
+    m.set_defaults(func=cmd_mission)
+
+    au = sub.add_parser("autonomy", help="grant/revoke scoped autonomous mode")
+    au_sub = au.add_subparsers(dest="op", required=True)
+    p = au_sub.add_parser("grant", help="grant autonomy for a mission (needs --confirm)")
+    p.add_argument("--mission", required=True)
+    p.add_argument("--confirm", action="store_true",
+                   help="explicit user confirmation after reviewing scope")
+    au_sub.add_parser("revoke", help="revoke autonomy immediately")
+    au_sub.add_parser("status", help="show autonomy state")
+    au.set_defaults(func=cmd_autonomy)
+
+    pr = sub.add_parser("profile", help="view/propose profile changes (approval always required)")
+    pr_sub = pr.add_subparsers(dest="op", required=True)
+    p = pr_sub.add_parser("view", help="view stored profile")
+    p.add_argument("--account", required=True)
+    p = pr_sub.add_parser("update", help="propose a profile change (never auto-approved)")
+    p.add_argument("--account", required=True)
+    p.add_argument("--display-name", default=None)
+    p.add_argument("--username", default=None)
+    p.add_argument("--bio", default=None)
+    p.add_argument("--avatar", default=None, help="local path/URL of new avatar image")
+    p = pr_sub.add_parser("approve", help="explicitly approve a profile change")
+    p.add_argument("id")
+    p = pr_sub.add_parser("done", help="log an approved profile change as applied")
+    p.add_argument("id")
+    p.add_argument("--result", default="")
+    p = pr_sub.add_parser("list", help="list profile proposals")
+    p.add_argument("--status", default=None)
+    pr.set_defaults(func=cmd_profile)
+
+    hb_p = sub.add_parser("heartbeat", help="heartbeat monitoring (protocol-compatible)")
+    hb_sub = hb_p.add_subparsers(dest="op", required=True)
+    hb_sub.add_parser("status", help="show heartbeat config + recent pings")
+    hb_sub.add_parser("test", help="test-ping the configured base URL")
+    p = hb_sub.add_parser("daemon", help="supervisor loop: heartbeat + due watcher polls")
+    p.add_argument("--interval", type=int, default=None, help="seconds between ticks")
+    p.add_argument("--once", action="store_true", help="single tick then exit")
+    p.add_argument("--watchers", default="", help="comma-separated watcher ids (default: all due)")
+    hb_p.set_defaults(func=cmd_heartbeat)
+
+    r = sub.add_parser("research", help="build a cross-platform topic research plan")
+    r.add_argument("topic")
+    r.add_argument("--platforms", default="",
+                   help="comma-separated subset (default: all)")
+    r.set_defaults(func=cmd_research)
+
+    n = sub.add_parser("analytics", help="engagement summaries from watcher state")
+    n.add_argument("--watcher", default=None)
+    n.add_argument("--days", type=int, default=None)
+    n.set_defaults(func=cmd_analytics)
+
+    g = sub.add_parser("growth", help="organic growth: goals, audits, playbooks")
+    g_sub = g.add_subparsers(dest="op", required=True)
+    p = g_sub.add_parser("goals", help="growth goals")
+    gg_sub = p.add_subparsers(dest="gop", required=True)
+    p = gg_sub.add_parser("set", help="set a follower goal")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--target-followers", type=int, required=True)
+    p.add_argument("--deadline", required=True, help="YYYY-MM-DD")
+    p.add_argument("--label", default="")
+    p.add_argument("--starting-followers", type=int, default=0)
+    p = gg_sub.add_parser("list", help="list goals + progress")
+    p.add_argument("--platform", default=None)
+    p = g_sub.add_parser("audit", help="5-pillar account audit")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--followers", type=int, default=None)
+    p.add_argument("--posts-per-week", type=float, default=None)
+    p.add_argument("--avg-views", type=float, default=None)
+    p.add_argument("--avg-likes", type=float, default=None)
+    p.add_argument("--avg-comments", type=float, default=None)
+    p.add_argument("--niche", default=None)
+    p.add_argument("--has-bio", action="store_true", default=None)
+    p.add_argument("--has-link", action="store_true", default=None)
+    p.add_argument("--has-avatar", action="store_true", default=None)
+    p.add_argument("--has-cta", action="store_true", default=None)
+    p = g_sub.add_parser("playbook", help="print a platform's organic playbook")
+    p.add_argument("--platform", required=True,
+                   help=",".join(growth_strategy.list_platforms()))
+    g.set_defaults(func=cmd_growth)
+
+    y = sub.add_parser("youtube", help="YouTube packaging: preflight, titles, descriptions")
+    y_sub = y.add_subparsers(dest="op", required=True)
+    p = y_sub.add_parser("preflight", help="quality gate before posting a video")
+    p.add_argument("--title", default="")
+    p.add_argument("--thumbnail", default="", help="thumbnail path or 'yes'")
+    p.add_argument("--hook-30s", action="store_true")
+    p.add_argument("--resolution", default="1080p")
+    p.add_argument("--audio", action="store_true")
+    p.add_argument("--retention-edit", action="store_true")
+    p.add_argument("--description", default="")
+    p.add_argument("--end-screen", action="store_true")
+    p.add_argument("--captions", action="store_true")
+    p.add_argument("--video", default="", help="video file: also run the spec preflight")
+    p.add_argument("--placement", default="long-form", choices=["long-form", "shorts"],
+                   help="which YouTube placement to validate --video against")
+    p = y_sub.add_parser("titles", help="5 scored title variants from a raw idea")
+    p.add_argument("idea")
+    p.add_argument("--keyword", default="")
+    p = y_sub.add_parser("description", help="build an SEO-structured description")
+    p.add_argument("--title", required=True)
+    p.add_argument("--summary", default="")
+    p.add_argument("--timestamps", default="")
+    p.add_argument("--link", action="append", default=[], help="label=url (repeatable)")
+    p.add_argument("--cta", default="")
+    p.add_argument("--hashtags", default="")
+    p = y_sub.add_parser("thumbnail-brief", help="generate a thumbnail design brief")
+    p.add_argument("--topic", required=True)
+    p.add_argument("--style", default="bold minimal")
+    p.add_argument("--text", default="")
+    y.set_defaults(func=cmd_youtube)
+
+    v = sub.add_parser("voice", help="write like a human: checks and style guide")
+    v_sub = v.add_subparsers(dest="op", required=True)
+    p = v_sub.add_parser("check", help="score text for AI-ness")
+    p.add_argument("--text", required=True)
+    p.add_argument("--platform", default="general")
+    v_sub.add_parser("guide", help="print the voice style guide")
+    v.set_defaults(func=cmd_voice)
+
+    s = sub.add_parser("security", help="security-conscious operations")
+    s_sub = s.add_subparsers(dest="op", required=True)
+    s_sub.add_parser("audit", help="audit state files for secrets + hardening reminders")
+    s_sub.add_parser("checklist", help="print the security checklist")
+    p = s_sub.add_parser("scan", help="scan text for secret-shaped content")
+    p.add_argument("--text", required=True)
+    s.set_defaults(func=cmd_security)
+
+    st = sub.add_parser("study", help="study-to-improve: journal + experiments")
+    st_sub = st.add_subparsers(dest="op", required=True)
+    p = st_sub.add_parser("run", help="analyze performance, write journal entry")
+    p.add_argument("--propose", action="store_true",
+                   help="also write review-only improvement proposals")
+    p = st_sub.add_parser("experiment", help="A/B experiments")
+    e_sub = p.add_subparsers(dest="eop", required=True)
+    p = e_sub.add_parser("start", help="start an experiment")
+    p.add_argument("--name", required=True)
+    p.add_argument("--kind", required=True, help="e.g. title, hook, thumbnail")
+    p.add_argument("--a", required=True)
+    p.add_argument("--b", required=True)
+    e_sub.add_parser("list", help="list experiments")
+    p = e_sub.add_parser("conclude", help="conclude an experiment with metrics")
+    p.add_argument("--name", required=True)
+    p.add_argument("--metric-a", type=float, required=True)
+    p.add_argument("--metric-b", type=float, required=True)
+    st.set_defaults(func=cmd_study)
+
+    ident = sub.add_parser("identity", help="persona embodiment: be the account owner")
+    i_sub = ident.add_subparsers(dest="op", required=True)
+    p = i_sub.add_parser("create", help="create a persona file for an account")
+    p.add_argument("--account", required=True)
+    p.add_argument("--name", required=True, help="owner's name")
+    p.add_argument("--voice-traits", default="", help="comma-separated")
+    p.add_argument("--facts", default="", help="comma-separated known facts")
+    p.add_argument("--opinions", default="", help="comma-separated opinions")
+    p.add_argument("--never-say", default="", help="comma-separated forbidden phrases")
+    p.add_argument("--notes", default="", help="free-form persona notes")
+    p = i_sub.add_parser("show", help="show an account's persona")
+    p.add_argument("--account", required=True)
+    p = i_sub.add_parser("check", help="verify text is written as the owner")
+    p.add_argument("--text", required=True)
+    p.add_argument("--account", required=True)
+    p = i_sub.add_parser("add", help="create a persistent identity")
+    p.add_argument("--name", required=True)
+    p.add_argument("--owner", default="", help="owner's name")
+    i_sub.add_parser("list", help="list identities and their accounts")
+    p = i_sub.add_parser("link", help="link a social account to an identity (persona + permission scope)")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--account", required=True, help="account label")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--handle", default="")
+    p = i_sub.add_parser("unlink", help="unlink an account from an identity")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--account", required=True)
+    p = i_sub.add_parser("grant", help="grant an action to an identity")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--action", required=True)
+    p = i_sub.add_parser("revoke", help="revoke an action from an identity")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--action", required=True)
+    p = i_sub.add_parser("check-perm", help="fail-closed permission check for an identity")
+    p.add_argument("--identity", required=True)
+    p.add_argument("--action", required=True)
+    ident.set_defaults(func=cmd_identity)
+
+    sc = sub.add_parser("scheduler", help="shared-core scheduler (state in memory DB)")
+    sc_sub = sc.add_subparsers(dest="op", required=True)
+    p = sc_sub.add_parser("add", help="register a job")
+    p.add_argument("name")
+    p.add_argument("--kind", required=True, choices=("once", "interval", "daily"),
+                   help="once: --spec ISO run_at; interval: --spec seconds; daily: --spec HH:MM")
+    p.add_argument("--spec", default="")
+    p.add_argument("--payload", default="", help="JSON payload")
+    p = sc_sub.add_parser("list", help="list jobs")
+    p.add_argument("--status", default=None)
+    p = sc_sub.add_parser("enable", help="enable a job")
+    p.add_argument("name")
+    p = sc_sub.add_parser("disable", help="disable a job")
+    p.add_argument("name")
+    sc_sub.add_parser("tick", help="fire due jobs (idempotency-keyed intents)")
+    sc_sub.add_parser("seed", help="seed the default housekeeping jobs")
+    sc.set_defaults(func=cmd_scheduler)
+
+    ws = sub.add_parser("workspace", help="per-platform workspaces (shared core never duplicated)")
+    ws_sub = ws.add_subparsers(dest="op", required=True)
+    p = ws_sub.add_parser("init", help="create a workspace for any platform")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--identity", default="",
+                   help="identity id: recorded in workspace.yaml as the"
+                        " persona this workspace operates as")
+    ws_sub.add_parser("list", help="list workspaces")
+    ws.set_defaults(func=cmd_workspace)
+
+    mo = sub.add_parser("moderate", help="moderate your OWN comment sections (approval-gated)")
+    mo_sub = mo.add_subparsers(dest="op", required=True)
+    p = mo_sub.add_parser("scan", help="classify comments from a fixture file")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--post", required=True)
+    p.add_argument("--fixture", required=True)
+    p = mo_sub.add_parser("hide", help="propose hiding a comment (approval-gated)")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--account", required=True)
+    p.add_argument("--post", required=True)
+    p.add_argument("--comment", required=True)
+    p.add_argument("--text", default="", help="comment text (for classification)")
+    p.add_argument("--reason", default="")
+    p = mo_sub.add_parser("approve", help="approve a hide proposal")
+    p.add_argument("--id", required=True)
+    p = mo_sub.add_parser("done", help="log an approved hide as performed")
+    p.add_argument("--id", required=True)
+    p = mo_sub.add_parser("list", help="list hide proposals")
+    p.add_argument("--status", default=None)
+    mo.set_defaults(func=cmd_moderate)
+
+    apv = sub.add_parser("approvals", help="unified human approval queue")
+    ap_sub = apv.add_subparsers(dest="op", required=True)
+    p = ap_sub.add_parser("list", help="list queued items")
+    p.add_argument("--status", default=None,
+                   help="filter: pending|approved|rejected|held|rate_limited|done")
+    p = ap_sub.add_parser("approve", help="approve a queued item (executes it)")
+    p.add_argument("--id", required=True, help="approval item id")
+    p = ap_sub.add_parser("reject", help="reject a queued item (reason logged)")
+    p.add_argument("--id", required=True, help="approval item id")
+    p.add_argument("--reason", default="", help="why it was rejected")
+    ap_sub.add_parser("policy", help="show per-type approval policy")
+    apv.set_defaults(func=cmd_approvals)
+
+    pe = sub.add_parser("people", help="people memory: recurring followers & conversations")
+    pe_sub = pe.add_subparsers(dest="op", required=True)
+    p = pe_sub.add_parser("top", help="top people by interaction score")
+    p.add_argument("--account", required=True)
+    p.add_argument("-n", type=int, default=10)
+    p = pe_sub.add_parser("show", help="show a person's record")
+    p.add_argument("--account", required=True)
+    p.add_argument("handle", help="handle to look up")
+    p = pe_sub.add_parser("note", help="attach a note to a person")
+    p.add_argument("--account", required=True)
+    p.add_argument("handle", help="handle")
+    p.add_argument("text", help="note text")
+    p = pe_sub.add_parser("tag", help="add a tag (e.g. top-fan, collaborator)")
+    p.add_argument("--account", required=True)
+    p.add_argument("handle", help="handle")
+    p.add_argument("tag", help="tag to add")
+    p = pe_sub.add_parser("untag", help="remove a tag")
+    p.add_argument("--account", required=True)
+    p.add_argument("handle", help="handle")
+    p.add_argument("tag", help="tag to remove")
+    pe.set_defaults(func=cmd_people)
+
+    rl = sub.add_parser("ratelimit", help="central rate-limit controller")
+    rl_sub = rl.add_subparsers(dest="op", required=True)
+    rl_sub.add_parser("status", help="bucket usage and remaining quota")
+    rl_sub.add_parser("config", help="effective per-action limits")
+    rl.set_defaults(func=cmd_ratelimit)
+
+    cr = sub.add_parser("crisis", help="crisis mode: global kill switch for acting")
+    cr_sub = cr.add_subparsers(dest="op", required=True)
+    p = cr_sub.add_parser("on", help="pause ALL acting operations immediately")
+    p.add_argument("--reason", default="", help="why crisis mode was triggered")
+    cr_sub.add_parser("off", help="clear crisis mode (explicit only, never auto)")
+    cr_sub.add_parser("status", help="show crisis state")
+    cr.set_defaults(func=cmd_crisis)
+
+    li = sub.add_parser("listen", help="fast-poll notification/comment/DM listener")
+    li_sub = li.add_subparsers(dest="op", required=False)
+    li_sub.add_parser("once", help="single listen pass (default)")
+    li.add_argument("--once", action="store_true", help="single pass and exit")
+    li.add_argument("--interval", type=int, default=60,
+                    help="poll interval seconds for continuous mode")
+    li.add_argument("--watchers", default=None,
+                    help="comma-separated watcher ids (default: all listen types)")
+    li.set_defaults(func=cmd_listen, op="once")
+
+    me = sub.add_parser("memory", help="permanent memory: the agent's brain")
+    me_sub = me.add_subparsers(dest="op", required=True)
+    p = me_sub.add_parser("query", help="read-only SELECT against memory.db")
+    p.add_argument("sql", help="SELECT statement (only SELECT is allowed)")
+    p = me_sub.add_parser("remember", help="record a decision and its why")
+    p.add_argument("summary", help="the decision")
+    p.add_argument("--by", default="user", help="who decided (default: user)")
+    p.add_argument("--why", default="", help="rationale")
+    me_sub.add_parser("recall", help="list recorded decisions")
+    p = me_sub.add_parser("relate", help="add a relationship-graph edge")
+    p.add_argument("subject", help="type:id, e.g. follower:ada")
+    p.add_argument("predicate", help="e.g. frequent_customer_of")
+    p.add_argument("object", help="type:id, e.g. brand:nova")
+    p.add_argument("--meta", default="", help="JSON metadata")
+    p = me_sub.add_parser("graph", help="show edges touching an entity")
+    p.add_argument("entity", help="type:id, e.g. brand:nova")
+    mc = me_sub.add_parser("campaign", help="campaigns")
+    mc_sub = mc.add_subparsers(dest="cop", required=True)
+    p = mc_sub.add_parser("add", help="create a campaign")
+    p.add_argument("name")
+    p.add_argument("--account", default="")
+    p.add_argument("--goal", default="")
+    mc_sub.add_parser("list", help="list campaigns")
+    ms = me_sub.add_parser("schedule", help="posting schedule")
+    ms_sub = ms.add_subparsers(dest="sop", required=True)
+    p = ms_sub.add_parser("add", help="schedule an action")
+    p.add_argument("--account", default="")
+    p.add_argument("type", help="action type, e.g. publish_post")
+    p.add_argument("run_at", help="ISO timestamp to run at")
+    p.add_argument("--payload", default="", help="JSON payload")
+    p.add_argument("--recurrence", default="")
+    ms_sub.add_parser("list", help="list scheduled items")
+    p = ms_sub.add_parser("done", help="mark a scheduled item done")
+    p.add_argument("id", type=int)
+    mt = me_sub.add_parser("content", help="content library")
+    mt_sub = mt.add_subparsers(dest="top", required=True)
+    p = mt_sub.add_parser("add", help="register a content item")
+    p.add_argument("--account", default="")
+    p.add_argument("kind", help="video|image|text|audio")
+    p.add_argument("title")
+    p.add_argument("--file", default="")
+    p.add_argument("--caption", default="")
+    p.add_argument("--campaign", type=int, default=None)
+    p = mt_sub.add_parser("list", help="list content items")
+    p.add_argument("--account", default="")
+    mv = me_sub.add_parser("voice", help="per-account brand voice")
+    mv_sub = mv.add_subparsers(dest="vop", required=True)
+    p = mv_sub.add_parser("set", help="set brand voice")
+    p.add_argument("account")
+    p.add_argument("--tone", default="")
+    p.add_argument("--banned", default="", help="comma-separated banned terms")
+    p.add_argument("--dos", default="", help="comma-separated dos")
+    p.add_argument("--donts", default="", help="comma-separated don'ts")
+    p = mv_sub.add_parser("show", help="show brand voice")
+    p.add_argument("account")
+    p = mv_sub.add_parser("learn-example", help="teach the voice with a real example")
+    p.add_argument("account")
+    p.add_argument("--text", required=True, help="the owner's real writing")
+    p.add_argument("--kind", default="post", help="post|comment|dm|bio")
+    p = mv_sub.add_parser("learn-rule", help="teach the voice an explicit style rule")
+    p.add_argument("account")
+    p.add_argument("--text", required=True, help="the rule, e.g. never start with 'hey guys'")
+    mc2 = me_sub.add_parser("convo", help="conversation log (agent<->user turns)")
+    mc2_sub = mc2.add_subparsers(dest="cop", required=True)
+    p = mc2_sub.add_parser("log", help="log a turn worth remembering")
+    p.add_argument("role", choices=("user", "agent", "system"))
+    p.add_argument("--text", required=True)
+    p.add_argument("--account", default="")
+    p.add_argument("--mission", type=int, default=None)
+    p.add_argument("--kind", default="chat")
+    p = mc2_sub.add_parser("list", help="list logged turns")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--account", default=None)
+    p.add_argument("--mission", type=int, default=None)
+    mm = me_sub.add_parser("missions", help="pending/active/completed missions + action ledger")
+    mm_sub = mm.add_subparsers(dest="mop", required=True)
+    p = mm_sub.add_parser("create", help="create a mission record")
+    p.add_argument("name")
+    p.add_argument("--type", default="custom")
+    p.add_argument("--account", default="")
+    p.add_argument("--spec", default="", help="JSON spec")
+    mm_sub.add_parser("list", help="list missions").add_argument(
+        "--status", default=None)
+    p = mm_sub.add_parser("set-status", help="change a mission's status")
+    p.add_argument("name")
+    p.add_argument("status", choices=("pending", "active", "paused", "held",
+                                      "completed", "failed", "cancelled"))
+    mm_sub.add_parser("pending", help="missions the resume engine picks up")
+    p = mm_sub.add_parser("ledger", help="completed actions ledger")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--status", default=None)
+    ma2 = me_sub.add_parser("analytics", help="per-platform performance analytics")
+    ma2_sub = ma2.add_subparsers(dest="aop", required=True)
+    p = ma2_sub.add_parser("log", help="log a metric sample")
+    p.add_argument("platform")
+    p.add_argument("metric")
+    p.add_argument("value", type=float)
+    p.add_argument("--account", default="")
+    p.add_argument("--period", default="")
+    p = ma2_sub.add_parser("summary", help="latest values per metric")
+    p.add_argument("--platform", default=None)
+    p.add_argument("--account", default=None)
+    ma = me_sub.add_parser("account", help="accounts in permanent memory")
+    ma_sub = ma.add_subparsers(dest="aop", required=True)
+    p = ma_sub.add_parser("add", help="register an account")
+    p.add_argument("label")
+    p.add_argument("platform")
+    p.add_argument("--handle", default="")
+    p.add_argument("--brand", default="")
+    ma_sub.add_parser("list", help="list accounts")
+    msp = me_sub.add_parser("sop", help="standard operating procedures")
+    msp_sub = msp.add_subparsers(dest="sopop", required=True)
+    p = msp_sub.add_parser("add", help="add an SOP (new version if title exists)")
+    p.add_argument("title")
+    p.add_argument("--body", default="", help="markdown body")
+    msp_sub.add_parser("list", help="list SOPs")
+    p = msp_sub.add_parser("show", help="show an SOP")
+    p.add_argument("id", type=int)
+    me.set_defaults(func=cmd_memory)
+
+    bk = sub.add_parser("backup", help="dual backup: local versioned + optional encrypted remote")
+    bk_sub = bk.add_subparsers(dest="op", required=True)
+    p = bk_sub.add_parser("list", help="list snapshots")
+    p.add_argument("--versioned", action="store_true",
+                   help="list versioned disaster snapshots (backups/<ts>/)")
+    p = bk_sub.add_parser("snapshot", help="take a manual snapshot")
+    p.add_argument("--trigger", default="manual",
+                   choices=("manual", "post_created", "video_rendered",
+                            "account_settings_changed", "memory_updated",
+                            "risky_action"))
+    p.add_argument("--files", default="", help="comma-separated home-relative paths")
+    p.add_argument("--note", default="")
+    p.add_argument("--versioned", action="store_true",
+                   help="immutable versioned snapshot of the protected set"
+                        " (backups/<timestamp>/ + latest pointer; cache excluded)")
+    p = bk_sub.add_parser("diff", help="compare two snapshots")
+    p.add_argument("id1")
+    p.add_argument("id2")
+    p = bk_sub.add_parser("restore", help="restore a snapshot (dry-run by default)")
+    p.add_argument("id", help="snapshot id (or timestamp, or 'latest' with --versioned)")
+    p.add_argument("--apply", action="store_true",
+                   help="stage the restore (never overwrites live files)")
+    p.add_argument("--versioned", action="store_true",
+                   help="restore a versioned disaster snapshot by timestamp")
+    p = bk_sub.add_parser("export", help="export a versioned snapshot as a portable bundle")
+    p.add_argument("id", help="snapshot timestamp (or 'latest')")
+    p.add_argument("--dest", required=True, help="bundle file path (.tar.gz)")
+    p = bk_sub.add_parser("import", help="import a portable bundle into this home")
+    p.add_argument("--bundle", required=True)
+    p.add_argument("--force", action="store_true",
+                   help="overwrite existing protected files")
+    p = bk_sub.add_parser("remote-setup", help="choose the optional remote backup provider")
+    p.add_argument("--provider", required=True,
+                   help="none|folder|github|gdrive|onedrive|dropbox|s3")
+    p.add_argument("--target", default="",
+                   help="folder path, owner/repo, rclone remote, or s3://bucket/prefix")
+    bk_sub.add_parser("remote-status", help="show remote backup config + sync readiness")
+    p = bk_sub.add_parser("sync", help="sync latest snapshot to the remote provider (consent-gated, encrypted)")
+    p.add_argument("--snapshot", default="latest",
+                   help="versioned snapshot timestamp (default: latest)")
+    bk.set_defaults(func=cmd_backup)
+
+    rc = sub.add_parser("recover", help="crash recovery: replay the action journal")
+    rc.add_argument("--execute", action="store_true",
+                    help="re-execute safe local work (renders); platform actions "
+                         "are never auto-executed")
+    rc.add_argument("--full", action="store_true",
+                    help="full resume engine: snapshot -> open tickets ->"
+                         " journal -> missions -> verify -> continue plan")
+    rc.set_defaults(func=cmd_recover)
+
+    ha = sub.add_parser("hands", help="execution tickets for the agent browser")
+    ha_sub = ha.add_subparsers(dest="op", required=True)
+    p = ha_sub.add_parser("ticket", help="issue / inspect / close execution tickets")
+    p.add_argument("top", choices=("create", "list", "show", "fulfill",
+                                   "cancel"),
+                   help="create: guard-checked ticket; list/show: inspect;"
+                        " fulfill/cancel: close the loop")
+    p.add_argument("--account", default="", help="account label")
+    p.add_argument("--platform", default="")
+    p.add_argument("--action", default="",
+                   help="like|comment|follow|unfollow|post_text|post_video|"
+                        "dm_send|hide_comment|subscribe|upload_video|post_photo")
+    p.add_argument("--target", default="", help="target URL (post/profile)")
+    p.add_argument("--thread", default="", help="DM thread URL")
+    p.add_argument("--text", default="", help="comment/post/DM text")
+    p.add_argument("--file", default="", help="media file for upload actions")
+    p.add_argument("--title", default="", help="title for upload/post actions")
+    p.add_argument("--approval-id", default="",
+                   help="approved queue item this ticket fulfills")
+    p.add_argument("--status", default="",
+                   help="list filter: open|fulfilled|cancelled")
+    p.add_argument("--ticket-id", default="", help="ticket id for show/fulfill/cancel")
+    p.add_argument("ticket", nargs="?",
+                   help="ticket id (positional, for show/fulfill/cancel)")
+    p.add_argument("--result", default="",
+                   help="what the agent browser did (fulfill)")
+    p.add_argument("--reason", default="", help="why the ticket was cancelled")
+    ha.set_defaults(func=cmd_hands)
+
+    cap = sub.add_parser("caption", help="platform-optimized caption generator")
+    cap_sub = cap.add_subparsers(dest="op", required=True)
+    p = cap_sub.add_parser("generate", help="generate one gated caption")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--topic", required=True)
+    p.add_argument("--tone", default="bold",
+                   help="bold|playful|educational|calm")
+    p.add_argument("--account", default="", help="optional: identity/voice gates as owner")
+    p.add_argument("--hashtags", default="", help="comma-separated extras")
+    p = cap_sub.add_parser("variants", help="n caption variants for A/B")
+    p.add_argument("--platform", required=True)
+    p.add_argument("--topic", required=True)
+    p.add_argument("--tone", default="bold")
+    p.add_argument("--account", default="")
+    p.add_argument("--hashtags", default="")
+    p.add_argument("--n", type=int, default=5)
+    cap.set_defaults(func=cmd_caption)
+
+    vi = sub.add_parser("video", help="local video editing via ffmpeg")
+    vi.add_argument("--dry-run", action="store_true",
+                    help="print ffmpeg commands without executing")
+    vi_sub = vi.add_subparsers(dest="op", required=True)
+    p = vi_sub.add_parser("info", help="probe duration/resolution/fps")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p = vi_sub.add_parser("clip", help="extract [start, start+duration)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--duration", required=True)
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("trim", help="cut [start, end) frame-accurately")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--end", required=True)
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("concat", help="join files (same codec/res)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--inputs", required=True, help="comma-separated paths")
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("to-vertical", help="16:9 -> 9:16 blurred-fill")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("to-horizontal", help="9:16 -> 16:9 blurred-fill")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("frame", help="extract a still (thumbnail source)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--at", default="3")
+    p.add_argument("--output", required=True)
+    p = vi_sub.add_parser("compress", help="re-encode to an upload preset")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--preset", default="tiktok",
+                   help="tiktok|reels|shorts|youtube")
+    p = vi_sub.add_parser("export", help="master export 480p..8k x h264/hevc/av1 (hw auto)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--resolution", default="1080p",
+                   help="480p|720p|1080p|1440p|4k|8k")
+    p.add_argument("--codec", default="h264", help="h264|hevc|av1")
+    p.add_argument("--vertical", action="store_true")
+    p = vi_sub.add_parser("fit", help="smart aspect-ratio fit (pad by default, never blind-crops)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print plan + ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--for", dest="for_", default="tiktok",
+                   help="target placement, e.g. tiktok, tiktok:feed, youtube:shorts, youtube:long-form")
+    p.add_argument("--crop", action="store_true",
+                   help="allow destructive crop-to-fill (requires --focus)")
+    p.add_argument("--focus", default=None,
+                   help="crop focus: center|top|bottom|left|right|face")
+    p.add_argument("--focus-x", type=float, default=None,
+                   help="crop focus x fraction 0..1 (with --focus-y)")
+    p.add_argument("--focus-y", type=float, default=None,
+                   help="crop focus y fraction 0..1 (with --focus-x)")
+    p = vi_sub.add_parser("preflight", help="validate a video file against a placement spec")
+    p.add_argument("--input", required=True)
+    p.add_argument("--for", dest="for_", default="tiktok",
+                   help="target placement, e.g. tiktok, youtube:shorts")
+    p = vi_sub.add_parser("plan", help="stored edit plans")
+    pl_sub = p.add_subparsers(dest="pop", required=True)
+    p = pl_sub.add_parser("create", help="store an edit plan (JSON steps)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--name", required=True)
+    p.add_argument("--steps", required=True, help="JSON list of {op, ...} steps")
+    p.add_argument("--description", default="")
+    pl_sub.add_parser("list", help="list plans")
+    p = pl_sub.add_parser("show", help="show a plan")
+    p.add_argument("--name", required=True)
+    p = pl_sub.add_parser("run", help="execute a plan")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--name", required=True)
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    vi.set_defaults(func=cmd_video)
+
+    au = sub.add_parser("audio", help="audio clipping/mixing via ffmpeg")
+    au.add_argument("--dry-run", action="store_true",
+                    help="print ffmpeg commands without executing")
+    au_sub = au.add_subparsers(dest="op", required=True)
+    p = au_sub.add_parser("clip", help="clip audio with fades")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--start", required=True)
+    p.add_argument("--duration", required=True)
+    p.add_argument("--fade-in", type=float, default=0)
+    p.add_argument("--fade-out", type=float, default=0)
+    p.add_argument("--output", required=True)
+    p = au_sub.add_parser("loop", help="loop audio to a duration")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--duration", required=True)
+    p.add_argument("--output", required=True)
+    p = au_sub.add_parser("mix", help="voiceover + ducked music bed")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--voiceover", required=True)
+    p.add_argument("--bed", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--duck-db", type=float, default=12)
+    p = au_sub.add_parser("extract", help="pull audio from a video")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--video", required=True)
+    p.add_argument("--output", required=True)
+    p = au_sub.add_parser("normalize", help="loudness to platform norms")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print ffmpeg commands without executing")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--preset", default="tiktok",
+                   help="tiktok|youtube|podcast")
+    au.set_defaults(func=cmd_audio)
+
+    ed = sub.add_parser("editor", help="AI Video Editor Worker: Kdenlive/Shotcut projects, grading, captions, QA, export")
+    ed.add_argument("--dry-run", action="store_true",
+                    help="print ffmpeg commands without executing")
+    ed_sub = ed.add_subparsers(dest="eop", required=True)
+
+    p = ed_sub.add_parser("watch", help="analyze a video -> analysis.json")
+    p.add_argument("--input", required=True)
+    p.add_argument("--out", required=True, help="work dir for analysis.json")
+
+    p = ed_sub.add_parser("highlights", help="rank highlight segments")
+    p.add_argument("--dir", required=True, help="work dir with analysis.json")
+    p.add_argument("--top", type=int, default=5)
+    p.add_argument("--make", action="store_true", help="cut highlight clips")
+
+    p = ed_sub.add_parser("grade", help="cinematic color grades")
+    g_sub = p.add_subparsers(dest="gop", required=True)
+    g_sub.add_parser("list", help="list grades")
+    p2 = g_sub.add_parser("apply", help="apply a grade")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+    p2.add_argument("--look", required=True,
+                    help="teal-noir|neon-city|teal-street|warm-vintage|noir|blockbuster|clean")
+
+    p = ed_sub.add_parser("transcribe", help="transcript -> timed SRT (heuristic if no whisper)")
+    p.add_argument("--input", required=True)
+    p.add_argument("--transcript", required=True, help="plain-text transcript file")
+    p.add_argument("--dir", required=True, help="work dir (uses analysis.json if present)")
+
+    p = ed_sub.add_parser("captions", help="burn styled captions into video")
+    p.add_argument("--input", required=True)
+    p.add_argument("--srt", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--style", default="pop", help="pop|karaoke|minimal")
+
+    p = ed_sub.add_parser("broll-plan", help="plan b-roll inserts from analysis")
+    p.add_argument("--dir", required=True)
+    p.add_argument("--broll", required=True, help="comma-separated b-roll files")
+    p.add_argument("--mode", default="pip", help="pip|cutaway")
+    p.add_argument("--position", default="bottom-right")
+    p.add_argument("--out", required=True, help="plan JSON path")
+
+    p = ed_sub.add_parser("broll-apply", help="apply a b-roll plan")
+    p.add_argument("--input", required=True)
+    p.add_argument("--plan", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--mode", default="pip", help="pip|cutaway")
+
+    p = ed_sub.add_parser("project", help="build a Kdenlive/Shotcut project from a JSON spec")
+    p.add_argument("--kind", dest="editor_kind", default="kdenlive",
+                   help="kdenlive|shotcut")
+    p.add_argument("--title", default="untitled")
+    p.add_argument("--profile", default="1080p30",
+                   help="1080p30|1080p60|4k30|vertical1080")
+    p.add_argument("--spec", required=True,
+                   help='JSON: {"assets":[...], "clips":[{"asset","track","in","out","effects":[]}], "markers":[]}')
+    p.add_argument("--out", required=True, help=".kdenlive or .mlt path")
+
+    p = ed_sub.add_parser("brand", help="brand kits for consistent identity")
+    b_sub = p.add_subparsers(dest="bop", required=True)
+    p2 = b_sub.add_parser("create", help="create a brand kit")
+    p2.add_argument("--label", default="default")
+    b_sub.add_parser("list", help="list kits")
+    p2 = b_sub.add_parser("show", help="show a kit")
+    p2.add_argument("--label", default="default")
+    p2 = b_sub.add_parser("apply", help="grade + watermark per kit")
+    p2.add_argument("--label", default="default")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+
+    p = ed_sub.add_parser("batch", help="apply one op across many files")
+    p.add_argument("--op-", dest="op_", required=True,
+                   help="grade|brand|captions|compress")
+    p.add_argument("--in", dest="in_", required=True, help="glob pattern")
+    p.add_argument("--out", required=True, help="output dir")
+    p.add_argument("--look", default="teal-noir")
+    p.add_argument("--preset", default="tiktok")
+    p.add_argument("--srt", default="")
+    p.add_argument("--style", default="pop")
+    p.add_argument("--kit", default="default")
+
+    p = ed_sub.add_parser("queue", help="render queue with crash recovery")
+    q_sub = p.add_subparsers(dest="qop", required=True)
+    p2 = q_sub.add_parser("add", help="queue a render command")
+    p2.add_argument("--name", required=True)
+    p2.add_argument("--cmd", required=True, help="exact shell-split command")
+    p2.add_argument("--at", default=None, help='schedule note, e.g. "02:00"')
+    q_sub.add_parser("list", help="list jobs")
+    p2 = q_sub.add_parser("run", help="execute queued jobs")
+    p2.add_argument("--name", default=None)
+    p2.add_argument("--resume", action="store_true",
+                    help="skip done jobs, retry failed within budget")
+
+    p = ed_sub.add_parser("qa", help="verify a render (black/freeze/desync/decode/subtitles)")
+    p.add_argument("--input", required=True)
+    p.add_argument("--srt", default=None)
+
+    p = ed_sub.add_parser("thumb", help="branded thumbnail with contrast check")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--at", type=float, default=3.0)
+    p.add_argument("--text", default="")
+    p.add_argument("--brand", default=None)
+
+    p = ed_sub.add_parser("camera", help="stabilize / denoise / white-balance")
+    c_sub = p.add_subparsers(dest="cop", required=True)
+    p2 = c_sub.add_parser("stabilize", help="2-pass vidstab (deshake fallback)")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+    p2 = c_sub.add_parser("enhance", help="denoise + WB + exposure recovery")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+    p2.add_argument("--denoise", default="medium")
+    p2.add_argument("--temp", default="neutral", help="cool|warm|neutral")
+    p2.add_argument("--brightness", type=float, default=0.0)
+    p2.add_argument("--contrast", type=float, default=1.0)
+    p2.add_argument("--deflicker", action="store_true")
+
+    p = ed_sub.add_parser("compress", help="CRF ladder or 2-pass size target")
+    x_sub = p.add_subparsers(dest="xop", required=True)
+    p2 = x_sub.add_parser("crf", help="single-pass CRF encode")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+    p2.add_argument("--codec", default="h264", help="h264|hevc|av1")
+    p2.add_argument("--quality", default="high", help="best|high|balanced|small")
+    p2 = x_sub.add_parser("twopass", help="2-pass encode to a size target")
+    p2.add_argument("--input", required=True)
+    p2.add_argument("--output", required=True)
+    p2.add_argument("--target-mb", type=float, required=True)
+    p2.add_argument("--codec", default="h264", help="h264|hevc|av1")
+
+    p = ed_sub.add_parser("export", help="master export 480p..8k x h264/hevc/av1 (hw auto)")
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--resolution", default="1080p",
+                   help="480p|720p|1080p|1440p|4k|8k")
+    p.add_argument("--codec", default="h264", help="h264|hevc|av1")
+    p.add_argument("--vertical", action="store_true")
+
+    p = ed_sub.add_parser("motion", help="motion graphics builders")
+    m_sub = p.add_subparsers(dest="mop", required=True)
+    p2 = m_sub.add_parser("lower-third", help="render a lower-third PNG")
+    p2.add_argument("--text", required=True)
+    p2.add_argument("--subtext", default="")
+    p2.add_argument("--output", required=True)
+    p2 = m_sub.add_parser("card", help="render a full-screen title card")
+    p2.add_argument("--text", required=True)
+    p2.add_argument("--output", required=True)
+    p2 = m_sub.add_parser("intro-outro", help="intro/outro cards from a brand kit")
+    p2.add_argument("--brand", default="default")
+    p2.add_argument("--out", required=True, help="output dir")
+    ed.set_defaults(func=cmd_editor)
+
+    d = sub.add_parser("doctor", help="environment checks")
+    d.set_defaults(func=cmd_doctor)
+
+    return ap
+
+
+def main(argv=None):
+    raw = list(sys.argv[1:] if argv is None else argv)
+    # `editor` accepts --dry-run anywhere in its argv (leaf parsers don't
+    # redeclare it, unlike video/audio): hoist it before parsing.
+    ed_dry = False
+    if raw[:1] == ["editor"] and "--dry-run" in raw:
+        raw = [a for a in raw if a != "--dry-run"]
+        ed_dry = True
+    args = build_parser().parse_args(raw)
+    if ed_dry:
+        args.dry_run = True
+    try:
+        args.func(args)
+    except tos_mod.ToSRefusal as e:
+        print(f"REFUSED (ToS): {e}", file=sys.stderr)
+        return 2
+    except Refused as e:
+        print(f"REFUSED (policy): {e}", file=sys.stderr)
+        return 2
+    except UsageError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except WatcherError as e:
+        print(f"watcher error: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
